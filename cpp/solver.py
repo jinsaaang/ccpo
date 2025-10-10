@@ -6,10 +6,10 @@ In this file, we write the solver for the CCO/RCCO/JCCO problems, which calls th
 import time
 from chance_constraint_encoders import *
 from pyscipopt import Model
-import configuration as config
+# import configuration as config
 
-# Hyperparameter setting:
-np.random.seed(config.config_seed)
+# # Hyperparameter setting:
+# np.random.seed(config.config_seed)
 
 
 def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust = False, epsilon = None, joint_method = None):

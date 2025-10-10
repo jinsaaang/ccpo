@@ -5,10 +5,10 @@ In this file we implement the functions for robust conformal prediction.
 # Import necessary modules.
 import math
 import numpy as np
-import configuration as config
+# import configuration as config
 
-# Hyperparameter setting:
-np.random.seed(config.config_seed)
+# # Hyperparameter setting:
+# np.random.seed(config.config_seed)
 
 
 # Functions for robust conformal prediction.

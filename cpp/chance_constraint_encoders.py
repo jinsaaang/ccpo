@@ -6,11 +6,11 @@ In this file, we write different quantile encoders for the chance constraint.
 import numpy as np
 from pyscipopt import quicksum
 from robust_conformal_prediction import *
-import configuration as config
+# import configuration as config
 
 
-# Hyperparameter setting:
-np.random.seed(config.config_seed)
+# # Hyperparameter setting:
+# np.random.seed(config.config_seed)
 
 class ChanceConstraintEncoder:
     """
