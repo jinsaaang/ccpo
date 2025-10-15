@@ -3,10 +3,14 @@ In this file, we write different quantile encoders for the chance constraint.
 """
 
 # Import necessary modules.
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 from pyscipopt import quicksum
 from robust_conformal_prediction import *
-# import configuration as config
+from config import config_basic as config
 
 
 # # Hyperparameter setting:

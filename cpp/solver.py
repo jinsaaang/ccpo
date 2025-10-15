@@ -12,7 +12,7 @@ from pyscipopt import Model
 # np.random.seed(config.config_seed)
 
 
-def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust = False, epsilon = None, joint_method = None):
+def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust = False, epsilon = None, joint_method = None, time_limit = 100):
     """
     Solve the CCO problem.
 
@@ -28,6 +28,7 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
     :param robust: whether the chance constraint encoding is robust.
     :param epsilon: distribution shift to be handled by the robust encoding (in KL divergence).
     :param joint_method: the method used for encoding the joint chance constraint. The acceptable methods include "Union" and "Max".
+    :param time_limit: the time limit for the solver in seconds.
     :return: the solution and the time used for solving the problem.
     """
     # Initialize the model.
@@ -47,7 +48,7 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
     else:
         raise Exception("The dimension of the decision variable is not supported.")
     # Set the time limit.
-    model.setRealParam("limits/time", config.time_limit)
+    model.setRealParam("limits/time", time_limit)
     # Add inequality constraints.
     for h in hs:
         model.addCons(h(x) <= 0)

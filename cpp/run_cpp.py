@@ -37,10 +37,9 @@ class CPPPortfolioOptimizer:
         
     def solve_cpp_method(self,
                         calibration_returns: np.ndarray,
-                        n_assets: int,
                         method: str,
                         omega: float = 0.9,
-                        time_limit: float = 300.0) -> Tuple[np.ndarray, float, float]:
+                        time_limit: float = 300.0) -> Tuple[np.ndarray, float, float, str]:
         """
         Solve portfolio optimization using cpp framework
         
@@ -50,53 +49,59 @@ class CPPPortfolioOptimizer:
              sum(w) = 1
              w >= 0
         
-        Reformulated as:
-        min_{w} -s  (objective)
+        Reformulated as CCO:
+        min_{w,s} -s  (objective)
         s.t. P(s - w^T r <= 0) >= 1 - alpha  (chance constraint)
-             sum(w) = 1  (budget)
-             w >= 0  (long-only, via variable bounds)
+             sum(w) = 1  (budget constraint)
+             w >= 0  (long-only, enforced by solver with lb=0)
         
         Args:
             calibration_returns: K x n_assets array of returns
-            n_assets: Number of assets
             method: 'SAA', 'CPP-KKT', 'CPP-MIP'
-            omega: SAA parameter
-            time_limit: Time limit in seconds
+            omega: SAA parameter (only used for SAA method)
+            time_limit: Solver time limit in seconds
             
         Returns:
-            weights, threshold, solve_time
+            weights: Portfolio weights (n_assets,)
+            threshold: VaR threshold s
+            solve_time: Time taken to solve
+            status: 'optimal' or error status string
         """
-        K = len(calibration_returns)
+        # Get number of assets from data shape (safer than passing as argument)
+        K, n_assets = calibration_returns.shape
         
         # Convert calibration returns to list of arrays (format expected by solver)
         training_Ys = [calibration_returns[i, :] for i in range(K)]
         
         # Decision variable dimension: n_assets + 1 (weights + threshold s)
-        # x[0:n_assets] = weights, x[n_assets] = threshold s
+        # x[0:n_assets] = weights (with lb=0 for long-only)
+        # x[n_assets] = threshold s
         x_dim = n_assets + 1
         
         # Chance constraint: P(s - w^T r <= 0) >= 1 - alpha
-        # f(x, Y) = x[n_assets] - sum(x[i] * Y[i] for i in range(n_assets))
         def f(x, Y):
             portfolio_return = sum(x[i] * Y[i] for i in range(n_assets))
             threshold = x[n_assets]
-            return threshold - portfolio_return  # Should be <= 0
+            return threshold - portfolio_return  # Should be <= 0 with probability >= 1-alpha
         
-        # Objective: minimize -s (i.e., maximize s)
+        # Objective: minimize -s (i.e., maximize s = VaR)
         def J(x):
             return -x[n_assets]
         
-        # Constraint: sum(w) = 1
+        # Equality constraint: sum(w) = 1
         def g_budget(x):
-            return sum(x[i] for i in range(n_assets)) - 1
+            return sum(x[i] for i in range(n_assets)) - 1.0
         
-        # No inequality constraints (bounds handled by variable definition)
+        # No inequality constraints (long-only enforced by lb=0 in solver)
         hs = []
+        # hs = [lambda x, i=i: -float(x[i]) for i in range(n_assets)]
         gs = [g_budget]
         
         try:
-            # Call cpp solver
+            # Pass time_limit to solver
             time_start = time.time()
+            
+            print(f"    [DEBUG] Calling solver: method={method}, n_assets={n_assets}, K={K}, time_limit={time_limit}")
             
             solution, solve_time_internal = solve(
                 x_dim=x_dim,
@@ -108,45 +113,55 @@ class CPPPortfolioOptimizer:
                 J=J,
                 method=method,
                 omega=omega if method == "SAA" else None,
-                robust=False,  # Can enable if needed
-                epsilon=None
+                robust=False,
+                epsilon=None,
+                time_limit=time_limit
             )
+            
+            print(f"    [DEBUG] Solver returned: type={type(solution)}, solve_time={solve_time_internal:.2f}s")
             
             solve_time = time.time() - time_start
             
-            # Extract weights and threshold
+            # Check solution status
             if isinstance(solution, str):
-                # Solver failed
-                print(f"Warning: Solver returned status: {solution}")
-                weights = np.ones(n_assets) / n_assets
-                threshold = 0.0
+                # Solver failed or infeasible
+                status = solution
+                print(f"⚠️  Solver status: {status}")
+                
+                # Return None to indicate failure (don't silently use equal weights)
+                return None, None, solve_time, status
             else:
+                # Solution found
                 weights = np.array(solution[:n_assets])
                 threshold = solution[n_assets]
                 
-                # Ensure weights are valid
-                weights = np.maximum(weights, 0)
-                weights = weights / np.sum(weights)
-            
-            return weights, threshold, solve_time
+                # Verify constraints (weights should already be >= 0 and sum to ~1 from solver)
+                weight_sum = np.sum(weights)
+                min_weight = np.min(weights)
+                
+                if min_weight < -1e-6 or abs(weight_sum - 1.0) > 1e-4:
+                    print(f"⚠️  Warning: Solver returned invalid weights!")
+                    print(f"    min(w) = {min_weight:.6f}, sum(w) = {weight_sum:.6f}")
+                    return None, None, solve_time, "invalid_solution"
+                
+                return weights, threshold, solve_time, "optimal"
             
         except Exception as e:
-            print(f"Error in CPP solver: {e}")
-            # Return equal weights as fallback
-            return np.ones(n_assets) / n_assets, 0.0, 0.0
+            print(f"❌ Error in CPP solver: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, 0.0, f"error: {str(e)}"
 
 
 def run_cpp_backtest(
     data_path: str = "snp50.csv",
     frequency: str = 'weekly',
-    lookback: int = 52,
     train_end_date: str = '2018-12-31',
     val_end_date: str = '2020-12-31',
     test_end_date: str = '2023-12-31',
     alpha: float = 0.1,
     methods: List[str] = ['MIP', 'KKT', 'SAA'],
     time_limit: float = 300.0,
-    big_M: float = 100.0,
     verbose: bool = True
 ):
     """
@@ -155,14 +170,12 @@ def run_cpp_backtest(
     Args:
         data_path: Path to data file
         frequency: Data frequency ('daily', 'weekly', 'monthly')
-        lookback: Lookback window for calibration
         train_end_date: End date for training
         val_end_date: End date for validation
         test_end_date: End date for test
         alpha: Miscoverage rate
         methods: List of methods to run ['MIP', 'KKT', 'SAA']
         time_limit: Solver time limit (seconds)
-        big_M: Big-M constant for MIP
         verbose: Print detailed logs
         
     Returns:
@@ -175,7 +188,6 @@ def run_cpp_backtest(
         print("="*80)
         print(f"Data: {data_path}")
         print(f"Frequency: {frequency}")
-        print(f"Lookback: {lookback}")
         print(f"Alpha (miscoverage): {alpha:.1%}")
         print(f"Methods: {methods}")
         print(f"Test period: {val_end_date} to {test_end_date}")
@@ -184,11 +196,13 @@ def run_cpp_backtest(
     # Load data
     if verbose:
         print("\nLoading data...")
+    
+    # Use loader for preprocessing and resampling only
     loader = TimeSeriesDataLoader(data_path=data_path)
     loader.preprocess_data()
     data_resampled = loader.resample_frequency(loader.processed_data, frequency)
     
-    # Convert to returns
+    # Convert to returns (simple numpy array - no batching needed for CPP)
     returns = data_resampled.pct_change().dropna()
     dates = returns.index
     returns_array = returns.values
@@ -226,26 +240,26 @@ def run_cpp_backtest(
     # Rolling window backtest on test set
     if verbose:
         print(f"\nRunning backtest on test set...")
-        print(f"Using rolling window of {lookback} periods for calibration")
+        print(f"Using all historical data for calibration (expanding window)")
     
-    # Combine train + val for calibration
-    calibration_data = np.vstack([train_returns, val_returns])
+    # Combine train + val for initial calibration base
+    calibration_base = np.vstack([train_returns, val_returns])
     
     for t in range(len(test_returns)):
         if verbose and t % 10 == 0:
             print(f"  Processing period {t+1}/{len(test_returns)}...")
         
-        # Use last 'lookback' periods for calibration
-        if t < lookback:
-            # Use end of calibration data + test data so far
-            calib_start = len(calibration_data) - (lookback - t)
-            calib_returns = np.vstack([
-                calibration_data[calib_start:],
-                test_returns[:t] if t > 0 else []
-            ])
+        # Use all historical data up to (but not including) current period t
+        # t=0: only calibration_base (train + val)
+        # t=1: calibration_base + test_returns[:1] (i.e., test_returns[0])
+        # t=k: calibration_base + test_returns[:k]
+        if t == 0:
+            calib_returns = calibration_base
         else:
-            # Use only test data
-            calib_returns = test_returns[t-lookback:t]
+            calib_returns = np.vstack([
+                calibration_base,
+                test_returns[:t]  # Up to t-1 (t is not included)
+            ])
         
         current_date = test_dates[t]
         
@@ -259,14 +273,30 @@ def run_cpp_backtest(
             
             omega = 0.9 if method == 'SAA' else None
             
-            weights, threshold, solve_time = optimizer.solve_cpp_method(
-                calib_returns, n_assets, 
+            if verbose and t == 0:
+                print(f"    Solving {method} with {len(calib_returns)} calibration samples...")
+            
+            weights, threshold, solve_time, status = optimizer.solve_cpp_method(
+                calib_returns,
                 method=cpp_method,
                 omega=omega,
                 time_limit=time_limit
             )
             
-            # Store weights
+            if verbose and t == 0:
+                print(f"    {method} completed: status={status}, time={solve_time:.2f}s")
+            
+            # Handle solver failure
+            if status != "optimal":
+                if verbose:
+                    print(f"⚠️  Period {t+1}, {method}: Solver failed with status '{status}'")
+                    print(f"    Skipping this period (using previous weights if available)")
+                
+                # Skip this period or use previous weights
+                # Don't add weights for failed solves to avoid contaminating results
+                continue
+            
+            # Store weights only if solve was successful
             portfolios[method].add_weights(weights, current_date, solve_time)
     
     # Calculate returns for all portfolios
@@ -310,17 +340,13 @@ def run_cpp_backtest(
 def run_cpp_rolling_backtest(
     data_path: str = "snp50.csv",
     frequency: str = 'weekly',
-    lookback: int = 52,
     start_date: str = '2005-01-01',
     end_date: str = '2024-12-31',
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
-    test_period_years: float = 2.0,
-    min_train_years: float = 6.0,
+    train_years: int = 6,
+    test_years: int = 2,
     alpha: float = 0.1,
     methods: List[str] = ['MIP', 'KKT', 'SAA'],
-    time_limit: float = 300.0,
-    big_M: float = 100.0
+    time_limit: float = 300.0
 ):
     """
     Run CPP backtest with rolling windows (non-overlapping test periods)
@@ -328,39 +354,35 @@ def run_cpp_rolling_backtest(
     Args:
         data_path: Path to data file
         frequency: Data frequency ('daily', 'weekly', 'monthly')
-        lookback: Lookback window for calibration
         start_date: Start date of available data
         end_date: End date of available data
-        train_ratio: Ratio of training data (default: 0.6)
-        val_ratio: Ratio of validation data (default: 0.2)
-        test_period_years: Length of each test period in years (default: 2.0)
-        min_train_years: Minimum training years for first split (default: 6.0)
+        train_years: Years of training data (default: 6)
+        test_years: Years of each test period (default: 2)
         alpha: Miscoverage rate
         methods: List of methods to run ['MIP', 'KKT', 'SAA']
         time_limit: Solver time limit (seconds)
-        big_M: Big-M constant for MIP
         
     Returns:
         all_split_results: List of (portfolio_collection, metrics, comparison_df) for each split
         aggregated_metrics: DataFrame with aggregated metrics across splits
+    
+    Note:
+        - Big-M values are set in config/config_basic.py (M=100, m=-100)
+        - Uses expanding window: all historical data up to current period
     """
     
-    print("\n" + "🎯"*40)
-    print("CPP Rolling Window Backtest")
-    print("🎯"*40)
+    print("CPP Rolling Window Backtest Starts")
     
-    # Generate rolling splits
+    # Generate rolling splits with 6:2:2 ratio (train:val:test)
     splits = generate_rolling_splits(
         start_date=start_date,
         end_date=end_date,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=1.0 - train_ratio - val_ratio,
-        test_period_years=test_period_years,
-        min_train_years=min_train_years
+        train_years=train_years,
+        test_years=test_years
     )
     
     print_rolling_splits(splits)
+    # print(stop)
     
     # Run backtest for each split
     all_split_results = []
@@ -374,14 +396,12 @@ def run_cpp_rolling_backtest(
         portfolio_collection, metrics, comparison_df = run_cpp_backtest(
             data_path=data_path,
             frequency=frequency,
-            lookback=lookback,
             train_end_date=split['train_end'],
             val_end_date=split['val_end'],
             test_end_date=split['test_end'],
             alpha=alpha,
             methods=methods,
             time_limit=time_limit,
-            big_M=big_M,
             verbose=True
         )
         
@@ -406,23 +426,21 @@ if __name__ == "__main__":
     all_results, aggregated_metrics = run_cpp_rolling_backtest(
         data_path="snp50.csv",
         frequency='weekly',
-        lookback=52,  # 1 year calibration window
         start_date='2005-01-01',
-        end_date='2024-12-31',
-        train_ratio=0.6,  # 60% train
-        val_ratio=0.2,    # 20% val
-        test_period_years=2.0,  # 2-year non-overlapping test periods
-        min_train_years=6.0,    # Minimum 6 years for first training
+        end_date='2015-01-01',
+        train_years=6,  # 6 years train
+        test_years=2,   # 2 years test (val is automatically 2 years = 6:2:2 ratio)
         alpha=0.1,  # 90% coverage
-        methods=['MIP', 'KKT', 'SAA'],  # Using cpp framework methods
-        time_limit=300.0,
-        big_M=100.0
+        methods=['KKT'],  # Start with KKT (much faster than MIP)
+        time_limit=60.0  # Reduce to 60 seconds for testing
     )
     
     print("\n✅ Rolling window backtest completed!")
     print(f"Total splits evaluated: {len(all_results)}")
     print("\n📌 Note: Using existing cpp framework (solver.py + chance_constraint_encoders.py)")
+    print(f"📌 Big-M values: M={100.0}, m={-100.0} (from config/config_basic.py)")
+    print(f"📌 Calibration: Expanding window (all historical data)")
     
     # Save aggregated results
-    aggregated_metrics.to_csv('cpp_aggregated_results.csv', index=False)
-    print("\n💾 Aggregated results saved to 'cpp_aggregated_results.csv'")
+    aggregated_metrics.to_csv('./results/cpp_aggregated_results.csv', index=False)
+    print("\n💾 Aggregated results saved to '/results/cpp_aggregated_results.csv'")
