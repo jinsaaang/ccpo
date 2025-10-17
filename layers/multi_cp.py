@@ -13,7 +13,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from layers.cp_utils import train_models, make_bootstrap_loader, compute_residuals
 
 class SPCI_and_EnbPI():
-    def __init__(self, X_train, X_valid, X_predict, Y_train, Y_valid, Y_predict, model_cls, scaler=None, device=None, r=None):
+    def __init__(self, X_train, X_valid, X_predict, Y_train, Y_valid, Y_predict, model_cls, loader, scaler=None, device=None, r=None):
         self.model_cls = model_cls
         self.X_train = X_train
         self.X_valid = X_valid
@@ -25,9 +25,12 @@ class SPCI_and_EnbPI():
         self.d = self.Y_train.shape[2]  # dimension
         self.Y_predict = Y_predict
         self.scaler = scaler
+        self.loader = loader 
+        
         self.models = []
         self.device = device
         self.r = r
+        
         
         if self.device is None:
            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -71,17 +74,15 @@ class SPCI_and_EnbPI():
           '''
           
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
         train_dataset = TensorDataset(self.X_train, self.Y_train, torch.zeros(len(self.X_train)), torch.zeros(len(self.X_train)))
         valid_dataset = TensorDataset(self.X_valid, self.Y_valid, torch.zeros(len(self.X_valid)), torch.zeros(len(self.X_valid)))
         test_dataset = TensorDataset(self.X_predict, self.Y_predict, torch.zeros(len(self.X_predict)), torch.zeros(len(self.X_predict)))
         
-        print("has inverse on train?", hasattr(self.X_train, "inverse_transform"))
-        print("has inverse on valid?", hasattr(self.X_valid, "inverse_transform"))
-        print("has inverse on test?", hasattr(self.X_predict, "inverse_transform"))
             
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
+
         # 2. 부트스트랩 DataLoader
         bootstrap_loaders = make_bootstrap_loader(train_dataset, B=B, batch_size=batch_size)
 
@@ -95,6 +96,7 @@ class SPCI_and_EnbPI():
             test_loader=test_loader,
             models=self.models,  
             device=device,
+            loader = self.loader
         )
 
         valid_pred  = result["valid"]["y_pred"].to(device)   # [n_valid, pred_len, d]
@@ -120,13 +122,16 @@ class SPCI_and_EnbPI():
         return result
 
     def get_local_ellipsoid(self):
+        
         if self.use_local_ellipsoid and self.get_test_et:
             idx = self.local_ellipsoid_idx
             X_prev = np.vstack([self.X_valid[idx:], self.X_predict[:idx]])
             max_past = min(1000, len(X_prev))
             X_prev = X_prev[-max_past:]
+            
             n_neighbors = int(0.1*max_past)
             knn = NearestNeighbors(n_neighbors=n_neighbors).fit(X_prev)
+            
             neighbors = knn.kneighbors(self.X_predict[idx].reshape(1, -1), return_distance=False).reshape(-1)
             Cov_neighbor = np.cov(self.Ensemble_online_resid[idx:][neighbors].T)
             lamb = 0.95
@@ -271,6 +276,15 @@ class SPCI_and_EnbPI():
             upper_v = ellipsoid_volume(cov_mat, upper)
             lower_v = ellipsoid_volume(cov_mat, lower)
             rolling_size.append(upper_v - lower_v)
+            
+            if self.use_local_ellipsoid:
+                if i < len(self.cov_matrix_ls):
+                    cov_mat = self.cov_matrix_ls[i]
+                else:
+                    cov_mat = self.global_cov
+            else:
+                cov_mat = self.global_cov
+                
         self.coverages_all = covered_or_not
         self.width_all = rolling_size
         mean_cov, mean_size = np.mean(covered_or_not), np.mean(rolling_size)

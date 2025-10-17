@@ -35,6 +35,7 @@ class TimeSeriesDataLoader:
         
         df = pd.read_csv(self.data_path, index_col=0, parse_dates=True)
         df = df.sort_index()
+        df = df.pct_change().dropna()
         
         self.raw_data = df
         print(f"Loaded data: {df.shape} ({df.index.min()} ~ {df.index.max()})")
@@ -75,11 +76,10 @@ class TimeSeriesDataLoader:
             self.load_data()
 
         df = self.raw_data.copy()
-        # (선택) 먼저 리샘플
+        
         if frequency != 'daily':
             df = self.resample_frequency(df, frequency)
 
-        # train 기간 마스크로만 fit
         end = pd.to_datetime(train_end_date)
         mask_fit = df.index <= end
         if mask_fit.sum() < 2:
@@ -225,17 +225,9 @@ class TimeSeriesDataLoader:
             test_end_date=test_end_date
         )
         
-        def inverse_fn(arr):
-            a = np.asarray(arr)
-            if a.ndim == 2:  # (N,d)
-                return self.scaler.inverse_transform(a)
-            N,L,D = a.shape   # (N,L,d)
-            return self.scaler.inverse_transform(a.reshape(N*L, D)).reshape(N, L, D)
-        
-        
-        train_dataset = TimeSeriesDataset(X_train, y_train, inverse_fn=inverse_fn)
-        val_dataset = TimeSeriesDataset(X_val, y_val, inverse_fn=inverse_fn)
-        test_dataset = TimeSeriesDataset(X_test, y_test, inverse_fn=inverse_fn)
+        train_dataset = TimeSeriesDataset(X_train, y_train)
+        val_dataset = TimeSeriesDataset(X_val, y_val)
+        test_dataset = TimeSeriesDataset(X_test, y_test)
         
         train_loader = DataLoader(
             train_dataset, 

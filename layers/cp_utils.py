@@ -348,7 +348,7 @@ def train_models(model_cls, data_loader, valid_data_loader, EPOCHS=100, lr=1e-3,
 #         },
 #     }
 
-def compute_residuals(model_type, valid_loader, test_loader, models, loader, device="cpu"): # [수정] loader 객체 추가
+def compute_residuals(model_type, valid_loader, test_loader, models, loader, device="cpu"):
     """
     models: 부트스트랩 학습된 모델 리스트
     model_type: ["MLP" | "DLinear" | "LSTM"]
@@ -362,16 +362,12 @@ def compute_residuals(model_type, valid_loader, test_loader, models, loader, dev
             return X.float().to(device).view(X.size(0), -1), y.float().to(device)
         return X.float().to(device), y.float().to(device)
 
-    # [수정 1] 데이터로더에서 (X, y)만 받도록 수정
     def gather_targets(loader):
         ys = []
-        for _, y in loader: # Unpacking 오류 수정
+        for _, y, _, _ in loader: # Unpacking 오류 수정
             ys.append(y)
         return torch.cat(ys, dim=0)
 
-    # =================================================================
-    # [수정 2] inverse 함수를 loader 객체를 사용하도록 전면 수정
-    # =================================================================
     def inverse(tensor_data, data_loader_instance):
         # TimeSeriesDataLoader에 inverse_transform이 있는지 확인
         if hasattr(data_loader_instance, 'inverse_transform') and callable(data_loader_instance.inverse_transform):
@@ -398,14 +394,14 @@ def compute_residuals(model_type, valid_loader, test_loader, models, loader, dev
 
             # Validation set 예측
             outs_v = []
-            for Xb, yb in valid_loader: # Unpacking 오류 수정
+            for Xb, yb, _, _ in valid_loader: # Unpacking 오류 수정
                 Xb, _ = prep_inputs(Xb, yb)
                 outs_v.append(m(Xb).detach().cpu())
             Pv_list.append(torch.cat(outs_v, dim=0))
 
             # Test set 예측
             outs_t = []
-            for Xb, yb in test_loader: # Unpacking 오류 수정
+            for Xb, yb, _, _ in test_loader: # Unpacking 오류 수정
                 Xb, _ = prep_inputs(Xb, yb)
                 outs_t.append(m(Xb).detach().cpu())
             Pt_list.append(torch.cat(outs_t, dim=0))
