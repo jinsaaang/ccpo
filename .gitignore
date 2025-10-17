@@ -96,7 +96,7 @@ dmypy.json
 .pyre/
 
 # Data files
-
+weights/
 *.h5
 *.pt
 
