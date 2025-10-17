@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import math
 import time as time
-import cp_utils
+from layers.cp_utils import *
 from sklearn.neighbors import NearestNeighbors
 import warnings
 from sklearn_quantile import RandomForestQuantileRegressor, SampleRandomForestQuantileRegressor
@@ -10,18 +10,60 @@ from numpy.lib.stride_tricks import sliding_window_view
 warnings.filterwarnings("ignore")
 import torch
 from torch.utils.data import TensorDataset, DataLoader
+from layers.cp_utils import train_models, make_bootstrap_loader, compute_residuals
 
 class SPCI_and_EnbPI():
-    def __init__(self, X_train, X_valid, X_predict, Y_train, Y_valid, Y_predict, model_cls):
+    def __init__(self, X_train, X_valid, X_predict, Y_train, Y_valid, Y_predict, model_cls, scaler=None, device=None, r=None):
         self.model_cls = model_cls
         self.X_train = X_train
         self.X_valid = X_valid
         self.X_predict = X_predict
         self.Y_train = Y_train
-        self.Y_valid = Y_valid        
+        self.Y_valid = Y_valid
+        
+        n, n1 = len(self.X_valid), len(self.X_predict)
+        self.d = self.Y_train.shape[2]  # dimension
         self.Y_predict = Y_predict
+        self.scaler = scaler
         self.models = []
-    
+        self.device = device
+        self.r = r
+        
+        if self.device is None:
+           self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+           
+        # local ellipsoid 관련
+        self.use_local_ellipsoid = False
+        self.local_ellipsoid_idx = 0
+        self.cov_matrix_ls = []
+        
+        # ensemble / residual / pred placeholders (fit 후 채워짐)
+        self.Ensemble_online_resid = None
+        self.Ensemble_train_interval_centers = np.ones((n,self.d))*np.inf
+        self.Ensemble_pred_interval_centers = np.ones((n1,self.d))*np.inf
+        
+        self.pred_len = None
+        self.d = None
+        self.valid_et = None
+        self.test_et = None
+        self.all_et = None
+        
+        # QRF / binning / hyperparams 기본값
+        self.bins = 5
+        self.beta_hat_bins = []
+        self.n_estimators = 10
+        self.max_d = 2
+        self.criterion = 'squared_error'
+        self.weigh_residuals = False
+        self.c = 0.995
+        self.T1 = None
+        
+        # 결과 저장용
+        self.Width_Ensemble = None
+        self.global_cov = None
+        self.global_cov_inv = None
+        
+        
     def fit_bootstrap_models_online_multistep(self, B, batch_size=64, EPOCHS=100, lr=1e-3, path='./weights/', patience=10, valid_mode=True):
         '''
           Train B bootstrap estimators from subsets of (X_train, Y_train), 
@@ -29,58 +71,58 @@ class SPCI_and_EnbPI():
           '''
           
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # 1. train/valid/test TensorDataset 생성
         train_dataset = TensorDataset(self.X_train, self.Y_train, torch.zeros(len(self.X_train)), torch.zeros(len(self.X_train)))
         valid_dataset = TensorDataset(self.X_valid, self.Y_valid, torch.zeros(len(self.X_valid)), torch.zeros(len(self.X_valid)))
+        test_dataset = TensorDataset(self.X_predict, self.Y_predict, torch.zeros(len(self.X_predict)), torch.zeros(len(self.X_predict)))
+        
+        print("has inverse on train?", hasattr(self.X_train, "inverse_transform"))
+        print("has inverse on valid?", hasattr(self.X_valid, "inverse_transform"))
+        print("has inverse on test?", hasattr(self.X_predict, "inverse_transform"))
+            
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+        # 2. 부트스트랩 DataLoader
+        bootstrap_loaders = make_bootstrap_loader(train_dataset, B=B, batch_size=batch_size)
 
-        # 2. 부트스트랩 DataLoader 생성
-        bootstrap_loaders = cp_utils.make_bootstrap_loader(train_dataset, B=B, batch_size=batch_size)
-
-        # 3. 부트스트랩 모델 학습
-        from train import train  # train 함수가 별도 파일에 있다면 import 필요
-        models, indices_ls = train(self.model_cls, bootstrap_loaders, valid_loader, EPOCHS=EPOCHS, lr=lr, path=path, patience=patience, valid_mode=valid_mode)
+        # 3. Boostrap model training
+        models, indices_ls = train_models(self.model_cls, bootstrap_loaders, valid_loader, EPOCHS=EPOCHS, lr=lr, path=path, patience=patience, valid_mode=valid_mode)
         self.models = models
 
-        # 4. valid/test 예측 및 residual 계산
-        n_valid = self.X_valid.shape[0]
-        n_test = self.X_predict.shape[0]
-        self.d = self.Y_train.shape[-1]
-        self.pred_len = self.Y_train.shape[1] if self.Y_train.ndim == 3 else 1
+        result = compute_residuals(
+            model_type=self.model_cls,                 
+            valid_loader=valid_loader,
+            test_loader=test_loader,
+            models=self.models,  
+            device=device,
+        )
 
-        boot_predictions_valid = torch.zeros((B, n_valid, self.pred_len, self.d), device=device)
-        boot_predictions_test = torch.zeros((B, n_test, self.pred_len, self.d), device=device)
+        valid_pred  = result["valid"]["y_pred"].to(device)   # [n_valid, pred_len, d]
+        test_pred   = result["test"]["y_pred"].to(device)    # [n_test,  pred_len, d]
+        valid_resid = result["valid"]["resid"].to(device)    
+        test_resid  = result["test"]["resid"].to(device)
 
-        for b, model_b in enumerate(self.models):
-            model_b.eval()
-            with torch.no_grad():
-                preds_valid = model_b(self.X_valid.to(device))
-                preds_test = model_b(self.X_predict.to(device))
-                boot_predictions_valid[b] = preds_valid
-                boot_predictions_test[b] = preds_test
-
-        # Aggregation 및 residual 계산
-        valid_pred = boot_predictions_valid.mean(dim=0)  # [n_valid, pred_len, d]
-        valid_resid = self.Y_valid.to(device) - valid_pred
         self.valid_pred = valid_pred
+        self.test_pred  = test_pred
         self.valid_resid = valid_resid
+        self.test_resid  = test_resid
 
-        test_pred = boot_predictions_test.mean(dim=0)    # [n_test, pred_len, d]
-        test_resid = self.Y_predict.to(device) - test_pred
-        self.test_pred = test_pred
-        self.test_resid = test_resid
+        n_valid, self.pred_len, self.d = valid_pred.shape
+        n_test  = test_pred.shape[0]
 
-        # non-conformity score 계산 (torch → numpy 변환)
         self.get_test_et = False
-        self.valid_et = self.get_et(valid_resid.reshape(-1, self.d).cpu().numpy())
+        self.valid_et = self.get_et(valid_resid.reshape(-1, self.d).detach().cpu().numpy())
+        print(self.valid_et.shape)
         self.get_test_et = True
-        self.test_et = self.get_et(test_resid.reshape(-1, self.d).cpu().numpy())
-        self.all_et = np.concatenate([self.valid_et, self.test_et])        
+        self.test_et  = self.get_et(test_resid.reshape(-1,  self.d).detach().cpu().numpy())
+        self.all_et   = np.concatenate([self.valid_et, self.test_et], axis=0)
+        
+        return result
 
     def get_local_ellipsoid(self):
         if self.use_local_ellipsoid and self.get_test_et:
             idx = self.local_ellipsoid_idx
-            X_prev = np.vstack([self.X_train[idx:], self.X_predict[:idx]])
+            X_prev = np.vstack([self.X_valid[idx:], self.X_predict[:idx]])
             max_past = min(1000, len(X_prev))
             X_prev = X_prev[-max_past:]
             n_neighbors = int(0.1*max_past)
@@ -116,6 +158,7 @@ class SPCI_and_EnbPI():
             global_cov, global_inv = self.get_rank_approx(np.cov(residuals.T))
             self.global_cov = global_cov
             self.global_cov_inv = global_inv
+            
         # Get the non-conformity scores
         nonconform_scores = []
         for i in range(len(residuals)):
@@ -139,13 +182,13 @@ class SPCI_and_EnbPI():
             use_SPCI: if True, we fit conditional quantile to compute the widths, rather than simply using empirical quantile
         '''
         self.alpha = alpha
-        n1 = len(self.X_train)
+        n1 = len(self.X_valid)
         # For SPCI, this is the "lag" for predicting quantile (i.e., feature dimension)
         # For EnbPI, this is how many past non-conformity scores we take the quantile over
         self.past_window = past_window 
         if smallT:
             # Namely, for special use of EnbPI, only use at most past_window number of LOO residuals.
-            n1 = min(self.past_window, len(self.X_train))
+            n1 = min(self.past_window, len(self.X_valid))
         # Now f^b and LOO residuals have been constructed from earlier
         out_sample_predict = self.Ensemble_pred_interval_centers
         start = time.time()
@@ -154,15 +197,18 @@ class SPCI_and_EnbPI():
             s = stride
             stride = 1
         # NOTE, NOT ALL rows are actually "observable" in multi-step context, as this is rolling
-        resid_strided = cp_utils.strided_app(self.all_et[len(self.X_train) - n1:-1], n1, stride)
+        resid_strided = strided_app(self.all_et[len(self.X_valid) - n1:-1], n1, stride)
+        
         # NEW: compute the non-conformity scores
         print(f'Shape of slided e_t lists is {resid_strided.shape}')
         num_unique_resid = resid_strided.shape[0]
         width_left = np.zeros(num_unique_resid)
         width_right = np.zeros(num_unique_resid)
-        # NOTE: 'max_features='log2', max_depth=2' make the model "simpler", which improves performance in practice
+       
+        # NOTE: 'max_features='log2', max_depth=2' make the model "simpler", which improves performance in practice 
         self.QRF_ls = []
         self.i_star_ls = []
+        
         for i in range(num_unique_resid):
             if use_SPCI:
                 remainder = i % s
@@ -171,9 +217,11 @@ class SPCI_and_EnbPI():
                     past_resid = resid_strided[i, :]
                     n2 = self.past_window
                     resid_pred = self.multi_step_QRF(past_resid, i, s, n2)
+                    
                 # Use the fitted regressor.
                 # NOTE, residX is NOT the same as before, as it depends on
                 # "past_resid", which has most entries replaced.
+                
                 rfqr= self.QRF_ls[remainder]
                 i_star = self.i_star_ls[remainder]
                 wid_all = rfqr.predict(resid_pred)
@@ -182,12 +230,13 @@ class SPCI_and_EnbPI():
                 wid_right = wid_all[num_mid+i_star]
                 width_left[i] = wid_left
                 width_right[i] = wid_right
+                
             else:
                 past_resid = resid_strided[i, :]
                 # Naive empirical quantile, where we use the SAME residuals for multi-step prediction
                 # The number of bins will be determined INSIDE binning
                 cov_mat = self.global_cov if self.use_local_ellipsoid is False else self.cov_matrix_ls[i]
-                beta_hat_bin = cp_utils.binning(past_resid, cov_mat, alpha, self.bins)
+                beta_hat_bin = binning(past_resid, cov_mat, alpha, self.bins)
                 self.beta_hat_bins.append(beta_hat_bin)
                 width_left[i] = np.percentile(
                     past_resid, math.ceil(100 * beta_hat_bin))
@@ -219,8 +268,8 @@ class SPCI_and_EnbPI():
             lower, upper = self.Width_Ensemble.iloc[i, 0], self.Width_Ensemble.iloc[i, 1]
             covered_or_not.append((et <= upper) and (et >= lower))
             cov_mat = self.global_cov if self.use_local_ellipsoid is False else self.cov_matrix_ls[i]
-            upper_v = cp_utils.ellipsoid_volume(cov_mat, upper)
-            lower_v = cp_utils.ellipsoid_volume(cov_mat, lower)
+            upper_v = ellipsoid_volume(cov_mat, upper)
+            lower_v = ellipsoid_volume(cov_mat, lower)
             rolling_size.append(upper_v - lower_v)
         self.coverages_all = covered_or_not
         self.width_all = rolling_size
@@ -242,6 +291,7 @@ class SPCI_and_EnbPI():
         # 1. Get "past_resid" into an auto-regressive fashion
         # This should be more carefully examined, b/c it depends on how long \hat{\eps}_t depends on the past
         # From practice, making it small make intervals wider
+        # valid로 train, test로 predict
         num = len(past_resid)
         resid_pred = past_resid[-n2:].reshape(1, -1)
         residX = sliding_window_view(past_resid[:num-s+1], window_shape=n2)
@@ -282,10 +332,10 @@ class SPCI_and_EnbPI():
             sample_weight = self.c ** np.arange(len(residY), 0, -1)
         if self.T1 is not None:
             self.T1 = min(self.T1, len(residY)) # Sanity check to make sure no errors in training
-            self.i_star, _, _, _ = cp_utils.binning_use_RF_quantile_regr(
+            self.i_star, _, _, _ = binning_use_RF_quantile_regr(
                 self.rfqr, self.cov_matrix, residX[-(self.T1+1):-1], residY[-self.T1:], residX[-1], beta_ls, sample_weight)
         else:
-            self.i_star, _, _, _ = cp_utils.binning_use_RF_quantile_regr(
+            self.i_star, _, _, _ = binning_use_RF_quantile_regr(
                 self.rfqr, self.cov_matrix, residX[:-1], residY, residX[-1], beta_ls, sample_weight)
     
     

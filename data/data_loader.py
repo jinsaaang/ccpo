@@ -12,6 +12,7 @@ class TimeSeriesDataset(Dataset):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
         
+        
     def __len__(self):
         return len(self.X)
     
@@ -22,7 +23,7 @@ class TimeSeriesDataLoader:
     
     def __init__(self, 
                  data_path: str = "snp50.csv",
-                 base_path: str = "../data/"):
+                 base_path: str = "./data/"):
         self.data_path = Path(base_path) / data_path
         self.raw_data = None
         self.processed_data = None
@@ -39,33 +40,76 @@ class TimeSeriesDataLoader:
         print(f"Loaded data: {df.shape} ({df.index.min()} ~ {df.index.max()})")
         return df
     
-    def preprocess_data(self) -> pd.DataFrame:
+    # def preprocess_data(self, dates) -> pd.DataFrame:
+    #     if self.raw_data is None:
+    #         self.load_data()
+        
+    #     data = self.raw_data.copy()
+        
+    #     # Forward fill missing values
+    #     # data = data.ffill().bfill()
+    #     # data = data.dropna()
+        
+    #     # Standard scaling
+    #     self.scaler = StandardScaler()
+    #     data_scaled = pd.DataFrame(
+    #         self.scaler.fit_transform(data),
+    #         index=data.index,
+    #         columns=data.columns
+    #     )
+        
+    #     self.processed_data = data_scaled
+    #     print(f"Preprocessed data: {data_scaled.shape}")
+    #     return data_scaled
+    
+    def preprocess_data(self, 
+                    train_end_date: str, 
+                    frequency: Literal['daily','weekly','monthly']='daily'
+                   ) -> pd.DataFrame:
+        """
+        train_end_date 이전(포함) 구간으로만 scaler.fit, 
+        같은 파라미터로 전 구간 transform.
+        frequency가 daily가 아니면 먼저 리샘플한 뒤 스케일링.
+        """
         if self.raw_data is None:
             self.load_data()
-        
-        data = self.raw_data.copy()
-        
-        # Forward fill missing values
-        # data = data.ffill().bfill()
-        # data = data.dropna()
-        
-        # Standard scaling
-        self.scaler = StandardScaler()
+
+        df = self.raw_data.copy()
+        # (선택) 먼저 리샘플
+        if frequency != 'daily':
+            df = self.resample_frequency(df, frequency)
+
+        # train 기간 마스크로만 fit
+        end = pd.to_datetime(train_end_date)
+        mask_fit = df.index <= end
+        if mask_fit.sum() < 2:
+            raise ValueError(f"Not enough data to fit scaler up to {train_end_date}.")
+
+        self.scaler = StandardScaler().fit(df.loc[mask_fit].values)
+
         data_scaled = pd.DataFrame(
-            self.scaler.fit_transform(data),
-            index=data.index,
-            columns=data.columns
+            self.scaler.transform(df.values),
+            index=df.index, columns=df.columns
         )
-        
         self.processed_data = data_scaled
-        print(f"Preprocessed data: {data_scaled.shape}")
+        print(f"Preprocessed (fit up to {end.date()}): {data_scaled.shape}")
         return data_scaled
     
     def inverse_transform(self, data: np.ndarray) -> np.ndarray:
         if self.scaler is None:
             return data
-        return self.scaler.inverse_transform(data)
-    
+        
+        arr = np.asarray(data)
+        if arr.ndim == 2:  # (N,d)
+            return self.scaler.inverse_transform(arr)
+        
+        elif arr.ndim == 3:
+            N, L, D = arr.shape
+            return self.scaler.inverse_transform(arr.reshape(N * L, D)).reshape(N, L, D)
+        
+        else:
+            raise ValueError(f'Unsupported dimension: {arr.ndim}')
+        
     def resample_frequency(self, 
                           data: pd.DataFrame,
                           frequency: Literal['daily', 'weekly', 'monthly']) -> pd.DataFrame:
@@ -98,8 +142,8 @@ class TimeSeriesDataLoader:
         X = np.array(X)
         y = np.array(y)
         
-        if forecast_horizon == 1:
-            y = y.squeeze(1)
+        # if forecast_horizon == 1:
+        #     y = y.squeeze(1)
         
         print(f"Created sequences - X: {X.shape}, y: {y.shape}")
         return X, y, pred_dates
@@ -152,15 +196,23 @@ class TimeSeriesDataLoader:
                           val_end_date: str = '2021-12-31',
                           test_end_date: Optional[str] = None,
                           batch_size: int = 32,
-                          shuffle_train: bool = True) -> Tuple:
+                          shuffle_train: bool = True,
+                          use_scaler: bool = True) -> Tuple:
         
-        self.preprocess_data()
+        self.load_data()
         
-        data_resampled = self.resample_frequency(self.processed_data, frequency)
+        if use_scaler:
+            data_scaled = self.preprocess_data(train_end_date=train_end_date, 
+                                       frequency=frequency)
+        else:
+            data_scaled = self.raw_data.copy()
+            self.scaler = None
+            
+        # data_resampled = self.resample_frequency(data_scaled, frequency)
         
         X, y, dates = self.create_sequences(
-            data_resampled, 
-            lookback=lookback,
+            data_scaled, 
+            lookback=lookback, 
             forecast_horizon=forecast_horizon
         )
         
@@ -173,9 +225,17 @@ class TimeSeriesDataLoader:
             test_end_date=test_end_date
         )
         
-        train_dataset = TimeSeriesDataset(X_train, y_train)
-        val_dataset = TimeSeriesDataset(X_val, y_val)
-        test_dataset = TimeSeriesDataset(X_test, y_test)
+        def inverse_fn(arr):
+            a = np.asarray(arr)
+            if a.ndim == 2:  # (N,d)
+                return self.scaler.inverse_transform(a)
+            N,L,D = a.shape   # (N,L,d)
+            return self.scaler.inverse_transform(a.reshape(N*L, D)).reshape(N, L, D)
+        
+        
+        train_dataset = TimeSeriesDataset(X_train, y_train, inverse_fn=inverse_fn)
+        val_dataset = TimeSeriesDataset(X_val, y_val, inverse_fn=inverse_fn)
+        test_dataset = TimeSeriesDataset(X_test, y_test, inverse_fn=inverse_fn)
         
         train_loader = DataLoader(
             train_dataset, 
