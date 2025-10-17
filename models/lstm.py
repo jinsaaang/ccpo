@@ -10,7 +10,7 @@ class LSTMModel(nn.Module):
         self.output_size = configs.c_out
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.dropout = min(configs.dropout * 1.5, 0.3)  # 드롭아웃 강화
+        self.dropout = min(configs.dropout * 1.5, 0.3)  # 드롭아웃
         
         # 입력 정규화
         self.input_norm = nn.LayerNorm(self.input_size)
