@@ -5,119 +5,92 @@ from datetime import datetime, timedelta
 
 
 def generate_rolling_splits(
-    start_date: str,
-    end_date: str,
-    train_years: int = 6,
-    test_years: int = 2
-) -> List[Dict[str, str]]:
+    dates: pd.DatetimeIndex,
+    K: int,
+    L: int,
+    V: int,
+    step_size: int = None
+) -> List[Dict]:
     """
-    Generate rolling window splits by year
+    Generate rolling window splits by data points (K, L, V)
     
     Args:
-        start_date: Start date of available data (YYYY-MM-DD)
-        end_date: End date of available data (YYYY-MM-DD)
-        train_years: Training period in years (default: 6)
-        test_years: Test period in years (default: 2)
+        dates: DatetimeIndex of the data
+        K: Number of data points for optimization (train)
+        L: Number of data points for calibration (val)
+        V: Number of data points for validation (test)
+        step_size: How many points to move forward for each split (default: V)
         
     Returns:
-        List of dicts with 'train_start', 'train_end', 'val_end', 'test_end'
-        Ratio is train:val:test = train_years : test_years : test_years
+        List of dicts with 'K_start_idx', 'K_end_idx', 'L_end_idx', 'V_end_idx',
+        'K_start_date', 'K_end_date', 'L_end_date', 'V_end_date'
         
     Example:
-        If train_years=6, test_years=2:
-        - Split 1: Train 6yr, Val 2yr, Test 2yr (total 10yr)
-        - Split 2: Train 6yr, Val 2yr, Test 2yr (shift by 2yr)
+        If K=100, L=50, V=50, step_size=50:
+        - Split 1: indices [0:100], [100:150], [150:200]
+        - Split 2: indices [50:150], [150:200], [200:250]
         - ...
-        - Last split: May overlap if remaining < test_years
     """
+    if step_size is None:
+        step_size = V  # Default: move forward by V points
     
-    start = pd.to_datetime(start_date)
-    end = pd.to_datetime(end_date)
+    total_window = K + L + V
+    n_data = len(dates)
     
-    total_years = (end - start).days / 365.25
-    
-    # Period lengths
-    val_years = test_years  # val and test have same length
-    total_period_years = train_years + val_years + test_years
+    if n_data < total_window:
+        raise ValueError(f"Not enough data. Need {total_window} points, got {n_data}")
     
     splits = []
-    current_start = start
+    current_start = 0
     
     while True:
-        # Calculate split dates
-        train_end = current_start + pd.DateOffset(years=train_years)
-        val_end = train_end + pd.DateOffset(years=val_years)
-        test_end = val_end + pd.DateOffset(years=test_years)
+        K_start_idx = current_start
+        K_end_idx = current_start + K
+        L_end_idx = K_end_idx + L
+        V_end_idx = L_end_idx + V
         
-        # Check if we have enough data
-        if test_end > end:
-            # Not enough data for full split
-            remaining_years = (end - current_start).days / 365.25
-            
-            if remaining_years < total_period_years:
-                # Create last split with overlap to maintain ratio
-                test_end = end
-                val_end = end - pd.DateOffset(years=test_years)
-                train_end = val_end - pd.DateOffset(years=val_years)
-                
-                # Ensure train_start doesn't go before start
-                if train_end < current_start + pd.DateOffset(years=train_years):
-                    # Need to overlap with previous data
-                    train_end = val_end - pd.DateOffset(years=val_years)
-                    if train_end - pd.DateOffset(years=train_years) < start:
-                        # Not enough data, skip this split
-                        break
-                
-                split = {
-                    'train_start': (train_end - pd.DateOffset(years=train_years)).strftime('%Y-%m-%d'),
-                    'train_end': train_end.strftime('%Y-%m-%d'),
-                    'val_end': val_end.strftime('%Y-%m-%d'),
-                    'test_end': test_end.strftime('%Y-%m-%d'),
-                    'test_start': val_end.strftime('%Y-%m-%d')
-                }
-                splits.append(split)
+        # Check if we have enough data for full split
+        if V_end_idx > n_data:
             break
         
-        # Normal split (no overlap)
         split = {
-            'train_start': current_start.strftime('%Y-%m-%d'),
-            'train_end': train_end.strftime('%Y-%m-%d'),
-            'val_end': val_end.strftime('%Y-%m-%d'),
-            'test_end': test_end.strftime('%Y-%m-%d'),
-            'test_start': val_end.strftime('%Y-%m-%d')
+            # Indices (end is exclusive)
+            'K_start_idx': K_start_idx,
+            'K_end_idx': K_end_idx,
+            'L_end_idx': L_end_idx,
+            'V_end_idx': V_end_idx,
+            # Dates
+            'K_start_date': dates[K_start_idx].strftime('%Y-%m-%d'),
+            'K_end_date': dates[K_end_idx - 1].strftime('%Y-%m-%d'),
+            'L_end_date': dates[L_end_idx - 1].strftime('%Y-%m-%d'),
+            'V_end_date': dates[V_end_idx - 1].strftime('%Y-%m-%d'),
         }
         
         splits.append(split)
         
-        # Move to next test period (non-overlapping by test_years)
-        current_start = current_start + pd.DateOffset(years=test_years)
+        # Move forward
+        current_start += step_size
     
     return splits
 
 
-def print_rolling_splits(splits: List[Dict[str, str]]):
+def print_rolling_splits(splits: List[Dict], K: int, L: int, V: int):
     """Print rolling splits in a readable format"""
-    print("\n" + "="*80)
+    print("\n" + "="*60)
     print(f"Rolling Window Splits (Total: {len(splits)} periods)")
-    print("="*80)
+    print(f"Window Size: K={K}, L={L}, V={V} (Total={K+L+V} points)")
+    print("="*60)
     
-    for i, split in enumerate(splits, 1):
-        train_start = pd.to_datetime(split['train_start'])
-        train_end = pd.to_datetime(split['train_end'])
-        val_end = pd.to_datetime(split['val_end'])
-        test_start = pd.to_datetime(split['test_start'])
-        test_end = pd.to_datetime(split['test_end'])
+    # for i, split in enumerate(splits, 1):
+    #     K_size = split['K_end_idx'] - split['K_start_idx']
+    #     L_size = split['L_end_idx'] - split['K_end_idx']
+    #     V_size = split['V_end_idx'] - split['L_end_idx']
         
-        train_years = (train_end - train_start).days / 365.25
-        val_years = (val_end - train_end).days / 365.25
-        test_years = (test_end - test_start).days / 365.25
-        
-        print(f"\n📅 Split {i}:")
-        print(f"  Train: {split['train_start']} to {split['train_end']} ({train_years:.1f} years)")
-        print(f"  Val:   {train_end.strftime('%Y-%m-%d')} to {split['val_end']} ({val_years:.1f} years)")
-        print(f"  Test:  {split['test_start']} to {split['test_end']} ({test_years:.1f} years)")
-    
-    print("="*80 + "\n")
+    #     print(f"\n📅 Split {i}:")
+    #     print(f"  K (Optimize):  [{split['K_start_idx']:4d}:{split['K_end_idx']:4d}] = {K_size:3d} points  |  {split['K_start_date']} to {split['K_end_date']}")
+    #     print(f"  L (Calibrate): [{split['K_end_idx']:4d}:{split['L_end_idx']:4d}] = {L_size:3d} points  |  {pd.to_datetime(split['K_end_date']) + pd.Timedelta(days=1):%Y-%m-%d} to {split['L_end_date']}")
+    #     print(f"  V (Validate):  [{split['L_end_idx']:4d}:{split['V_end_idx']:4d}] = {V_size:3d} points  |  {pd.to_datetime(split['L_end_date']) + pd.Timedelta(days=1):%Y-%m-%d} to {split['V_end_date']}")
+    # print("="*80 + "\n")
 
 
 def aggregate_metrics_across_splits(
@@ -219,13 +192,24 @@ def print_aggregated_metrics(agg_df: pd.DataFrame):
     print("="*80 + "\n")
 
 
-if __name__ == "__main__":
-    # Test rolling splits generation
-    splits = generate_rolling_splits(
-        start_date='2005-01-01',
-        end_date='2024-12-31',
-        train_years=6,
-        test_years=2
-    )
+# if __name__ == "__main__":
+#     # Test rolling splits generation
+#     import sys
+#     sys.path.append('..')
+#     from config import config_basic as config
     
-    print_rolling_splits(splits)
+#     # Create sample dates (daily data for 2 years)
+#     dates = pd.date_range(start='2020-01-01', end='2021-12-31', freq='D')
+    
+#     print(f"Total data points: {len(dates)}")
+#     print(f"Date range: {dates[0]} to {dates[-1]}")
+    
+#     splits = generate_rolling_splits(
+#         dates=dates,
+#         K=config.K,
+#         L=config.L,
+#         V=config.V,
+#         step_size=config.V  # Move forward by V points
+#     )
+    
+#     print_rolling_splits(splits, K=config.K, L=config.L, V=config.V)

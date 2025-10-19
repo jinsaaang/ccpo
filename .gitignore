@@ -96,18 +96,11 @@ dmypy.json
 .pyre/
 
 # Data files
-*.csv
-*.xlsx
-*.xls
 *.h5
 *.hdf5
-*.pkl
-*.pickle
 *.npy
 *.npz
-!data/factors.csv
-!data/industry49.csv
-!data/snp50.csv
+*.txt
 
 # Model files
 *.pt

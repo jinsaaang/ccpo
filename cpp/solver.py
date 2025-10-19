@@ -39,7 +39,12 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
     elif type(x_dim) == int and x_dim > 1:
         x = {}
         for i in range(x_dim):
-            x[i] = model.addVar(lb=0, ub=None, vtype="C", name="x(%s)" % (i))
+            if i == x_dim - 1:
+                # Last variable (threshold s): unbounded to allow negative values
+                x[i] = model.addVar(lb=None, ub=None, vtype="C", name="x(%s)" % (i))
+            else:
+                # Portfolio weights w_i: non-negative (long-only constraint)
+                x[i] = model.addVar(lb=0, ub=None, vtype="C", name="x(%s)" % (i))
     elif type(x_dim) == tuple or type(x_dim) == list:
         x = {}
         for i in range(x_dim[0]):
@@ -49,6 +54,13 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
         raise Exception("The dimension of the decision variable is not supported.")
     # Set the time limit.
     model.setRealParam("limits/time", time_limit)
+    
+    # Set tolerance parameters - relaxed for faster solving
+    model.setRealParam("numerics/feastol", 1e-5)      # Relaxed feasibility tolerance
+    model.setRealParam("numerics/epsilon", 1e-8)      # Epsilon for comparisons
+    model.setRealParam("numerics/sumepsilon", 1e-5)   # Epsilon for sums
+    model.setRealParam("limits/gap", 0.05)            # 5% gap tolerance (relaxed for speed)
+    
     # Add inequality constraints.
     for h in hs:
         model.addCons(h(x) <= 0)
@@ -69,12 +81,14 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
     objective = model.addVar(lb=None, ub=None, vtype="C", name="obj")
     model.addCons(J(x) <= objective)
     model.setObjective(objective, "minimize")
-    # Solve the model.
-    model.hideOutput()
+    
+    # Hide output and solve
+    model.hideOutput()  # Turn off SCIP logs
+    
     time_start = time.time()
     model.optimize()
     time_end = time.time()
-    if model.getStatus() == "optimal":
+    if model.getStatus() == "optimal" or model.getStatus() == "gaplimit":
         sol = model.getBestSol()
         if type(x_dim) == int and x_dim == 1:
             return sol[x], time_end - time_start
