@@ -56,10 +56,10 @@ def solve(x_dim, delta, training_Ys, hs, gs, f, J, method, omega = None, robust 
     model.setRealParam("limits/time", time_limit)
     
     # Set tolerance parameters - relaxed for faster solving
-    model.setRealParam("numerics/feastol", 1e-5)      # Relaxed feasibility tolerance
+    model.setRealParam("numerics/feastol", 1e-6)      # Relaxed feasibility tolerance
     model.setRealParam("numerics/epsilon", 1e-8)      # Epsilon for comparisons
-    model.setRealParam("numerics/sumepsilon", 1e-5)   # Epsilon for sums
-    model.setRealParam("limits/gap", 0.05)            # 5% gap tolerance (relaxed for speed)
+    model.setRealParam("numerics/sumepsilon", 1e-6)   # Epsilon for sums
+    model.setRealParam("limits/gap", 0.01)            # gap tolerance (relaxed for speed)
     
     # Add inequality constraints.
     for h in hs:

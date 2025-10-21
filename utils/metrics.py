@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List
+from typing import Dict, List, Any
 
 def calculate_cumulative_return(returns: np.ndarray) -> float:
     """Calculate cumulative return"""
@@ -31,10 +31,22 @@ def calculate_max_drawdown(returns: np.ndarray) -> float:
     drawdown = (cumulative - running_max) / running_max
     return np.min(drawdown)
 
-def calculate_turnover(weights_history: List[np.ndarray]) -> float:
-    """Calculate average portfolio turnover"""
+def calculate_turnover(weights_history) -> float:
+    """
+    Calculate average portfolio turnover
+    
+    Args:
+        weights_history: List or array of weight vectors
+        
+    Returns:
+        Average turnover across rebalancing periods
+    """
     if len(weights_history) < 2:
         return 0.0
+    
+    # Convert to numpy array if it's a list
+    if isinstance(weights_history, list):
+        weights_history = np.array(weights_history)
     
     turnovers = []
     for i in range(1, len(weights_history)):
@@ -43,46 +55,112 @@ def calculate_turnover(weights_history: List[np.ndarray]) -> float:
     
     return np.mean(turnovers)
 
-def calculate_violation_rate(portfolio_returns: np.ndarray, 
-                            threshold: float) -> float:
-    """Calculate violation rate (coverage rate)"""
-    violations = np.sum(portfolio_returns < threshold)
-    return violations / len(portfolio_returns)
 
-def calculate_all_metrics(portfolio_returns: np.ndarray,
-                         weights_history: List[np.ndarray],
-                         threshold: float = 0.0,
-                         solve_times: List[float] = None,
-                         risk_free_rate: float = 0.0,
-                         periods_per_year: int = 252) -> Dict:
-    """Calculate all portfolio metrics"""
+def calculate_portfolio_metrics(portfolio, 
+                                periods_per_year: int = 252,
+                                risk_free_rate: float = 0.0) -> Dict:
+    """
+    Calculate all performance metrics for a Portfolio object
+    
+    Args:
+        portfolio: Portfolio object with returns, weights, etc.
+        periods_per_year: Number of periods per year (252 for daily, 52 for weekly)
+        risk_free_rate: Annual risk-free rate
+        
+    Returns:
+        metrics: Dictionary of performance metrics
+    """
+    returns = portfolio.get_returns_array()
+    weights = portfolio.get_weights_array()
+    
+    if len(returns) == 0:
+        return {
+            'n_periods': 0,
+            'cumulative_return': 0.0,
+            'annualized_return': 0.0,
+            'volatility': 0.0,
+            'sharpe_ratio': 0.0,
+            'max_drawdown': 0.0,
+            'turnover': 0.0,
+            'avg_solve_time': 0.0,
+            'total_solve_time': 0.0
+        }
+    
     metrics = {}
+    metrics['n_periods'] = len(returns)
+    metrics['cumulative_return'] = calculate_cumulative_return(returns)
+    metrics['annualized_return'] = calculate_annualized_return(returns, periods_per_year)
+    metrics['volatility'] = calculate_volatility(returns, periods_per_year)
+    metrics['sharpe_ratio'] = calculate_sharpe_ratio(returns, risk_free_rate, periods_per_year)
+    metrics['max_drawdown'] = calculate_max_drawdown(returns)
+    metrics['turnover'] = calculate_turnover(weights)  # Pass numpy array directly
     
-    metrics['cumulative_return'] = calculate_cumulative_return(portfolio_returns)
-    metrics['annualized_return'] = calculate_annualized_return(portfolio_returns, periods_per_year)
-    metrics['volatility'] = calculate_volatility(portfolio_returns, periods_per_year)
-    metrics['sharpe_ratio'] = calculate_sharpe_ratio(portfolio_returns, risk_free_rate, periods_per_year)
-    metrics['max_drawdown'] = calculate_max_drawdown(portfolio_returns)
-    metrics['violation_rate'] = calculate_violation_rate(portfolio_returns, threshold)
-    metrics['coverage_rate'] = 1 - metrics['violation_rate']
-    metrics['turnover'] = calculate_turnover(weights_history)
+    # Computational metrics
+    solve_times = [t for t in portfolio.solve_times if t > 0]  # Only non-zero solve times
+    metrics['avg_solve_time'] = np.mean(solve_times) if solve_times else 0.0
+    metrics['total_solve_time'] = np.sum(solve_times)
     
-    if solve_times:
-        metrics['avg_solve_time'] = np.mean(solve_times)
-        metrics['total_solve_time'] = np.sum(solve_times)
-    else:
-        metrics['avg_solve_time'] = 0.0
-        metrics['total_solve_time'] = 0.0
+    # CPP-specific metrics
+    if portfolio.thresholds_post:
+        thresholds = np.array(portfolio.thresholds_post)
+        # For CPP, we stored threshold per rebalancing period, not per day
+        # Need to match returns with thresholds properly
+        # Simplified: just report average threshold
+        metrics['avg_threshold'] = np.mean(thresholds)
+        metrics['min_threshold'] = np.min(thresholds)
+        metrics['max_threshold'] = np.max(thresholds)
     
     return metrics
 
-def print_metrics(metrics: Dict, portfolio_name: str = "Portfolio"):
+
+def compare_methods(portfolios: Dict[str, Any], 
+                   periods_per_year: int = 252) -> pd.DataFrame:
+    """
+    Compare performance metrics across multiple portfolio methods
+    
+    Args:
+        portfolios: Dictionary of {method_name: Portfolio object}
+        periods_per_year: Number of periods per year
+        
+    Returns:
+        comparison_df: DataFrame with methods as rows and metrics as columns
+    """
+    all_metrics = {}
+    
+    for method_name, portfolio in portfolios.items():
+        all_metrics[method_name] = calculate_portfolio_metrics(
+            portfolio, 
+            periods_per_year=periods_per_year
+        )
+    
+    df = pd.DataFrame(all_metrics).T
+    
+    # Reorder columns for better readability
+    column_order = [
+        'n_periods', 'cumulative_return', 'annualized_return', 'volatility',
+        'sharpe_ratio', 'max_drawdown', 'turnover', 
+        'avg_solve_time', 'total_solve_time'
+    ]
+    
+    # Add CPP-specific columns if they exist
+    if 'avg_threshold' in df.columns:
+        column_order.extend(['avg_threshold', 'min_threshold', 'max_threshold'])
+    
+    # Only keep columns that exist
+    column_order = [col for col in column_order if col in df.columns]
+    df = df[column_order]
+    
+    return df
+
+
+def print_portfolio_metrics(metrics: Dict, portfolio_name: str = "Portfolio"):
     """Print metrics in a formatted way"""
     print(f"\n{'='*60}")
     print(f"{portfolio_name} Performance Metrics")
     print(f"{'='*60}")
     
     print(f"\n📊 Return Metrics:")
+    print(f"  Periods:              {metrics['n_periods']:>10}")
     print(f"  Cumulative Return:    {metrics['cumulative_return']:>10.2%}")
     print(f"  Annualized Return:    {metrics['annualized_return']:>10.2%}")
     
@@ -91,10 +169,6 @@ def print_metrics(metrics: Dict, portfolio_name: str = "Portfolio"):
     print(f"  Sharpe Ratio:         {metrics['sharpe_ratio']:>10.4f}")
     print(f"  Max Drawdown:         {metrics['max_drawdown']:>10.2%}")
     
-    print(f"\n✅ Coverage Metrics:")
-    print(f"  Coverage Rate:        {metrics['coverage_rate']:>10.2%}")
-    print(f"  Violation Rate:       {metrics['violation_rate']:>10.2%}")
-    
     print(f"\n💼 Trading Metrics:")
     print(f"  Avg Turnover:         {metrics['turnover']:>10.2%}")
     
@@ -102,19 +176,11 @@ def print_metrics(metrics: Dict, portfolio_name: str = "Portfolio"):
     print(f"  Avg Solve Time:       {metrics['avg_solve_time']:>10.4f}s")
     print(f"  Total Solve Time:     {metrics['total_solve_time']:>10.2f}s")
     
+    # CPP-specific metrics
+    if 'avg_threshold' in metrics:
+        print(f"\n🎯 CPP Threshold Metrics:")
+        print(f"  Avg Threshold:        {metrics['avg_threshold']:>10.6f}")
+        print(f"  Min Threshold:        {metrics['min_threshold']:>10.6f}")
+        print(f"  Max Threshold:        {metrics['max_threshold']:>10.6f}")
+    
     print(f"{'='*60}\n")
-
-def compare_portfolios(portfolios_metrics: Dict[str, Dict]) -> pd.DataFrame:
-    """Compare multiple portfolios"""
-    df = pd.DataFrame(portfolios_metrics).T
-    
-    column_order = [
-        'cumulative_return', 'annualized_return', 'volatility', 
-        'sharpe_ratio', 'max_drawdown', 'coverage_rate', 'violation_rate',
-        'turnover', 'avg_solve_time', 'total_solve_time'
-    ]
-    
-    column_order = [col for col in column_order if col in df.columns]
-    df = df[column_order]
-    
-    return df

@@ -14,8 +14,9 @@ import time
 from datetime import datetime
 
 from data.data_loader import TimeSeriesDataLoader
-from utils.portfolios import Portfolio, PortfolioCollection
-from utils.metrics import calculate_all_metrics, print_metrics, compare_portfolios
+from utils.portfolios import Portfolio
+from utils.metrics import calculate_portfolio_metrics, compare_methods, print_portfolio_metrics
+from utils.visualization import create_all_plots
 from utils.evaluate import generate_rolling_splits, print_rolling_splits, aggregate_metrics_across_splits, print_aggregated_metrics
 
 # Import cpp solver framework
@@ -426,7 +427,7 @@ def summarize_rolling_results(all_split_results: List[Dict]) -> Tuple[pd.DataFra
                 
             result = split_result[method]
             
-            if result['step1']['status'] == 'optimal':
+            if result['step1']['status'] == 'optimal': # need to fix
                 detailed_stats[method]['optimal_solutions'].append(result['step1']['weights'])
                 detailed_stats[method]['solver_times'].append(result['step1']['solve_time'])
                 detailed_stats[method]['thresholds_pre'].append(result['step1']['threshold_pre'])
@@ -472,8 +473,8 @@ def run_cpp_rolling_backtest(
     V: int = None,
     step_size: int = None,
     methods: List[str] = ['KKT'],
-    alpha: float = 0.1,
-    omega: float = 0.05,
+    alpha: float = 0.05,
+    omega: float = 0.03,
     time_limit: float = 300.0,
     log_file: str = './results/cpp_log.txt'
 ):
@@ -493,6 +494,14 @@ def run_cpp_rolling_backtest(
         time_limit: Solver time limit
         log_file: Path to log file (appends to existing file)
     """
+    # 📌 Create timestamped result folder
+    timestamp = datetime.now().strftime('%m%d%H%M')
+    result_folder = f'./results/run_{timestamp}'
+    os.makedirs(result_folder, exist_ok=True)
+    
+    # Update log file path to timestamped folder
+    log_file = os.path.join(result_folder, 'cpp_log.txt')
+    
     # Setup logger
     logger = Logger(log_file)
     logger.log_header()
@@ -524,9 +533,11 @@ def run_cpp_rolling_backtest(
         returns = data_resampled.pct_change().dropna()
         returns_array = returns.values
         dates = returns.index
+        asset_names = returns.columns.tolist()  # 📌 Get asset names
         
         print(f"Data loaded: {returns.shape[0]} periods, {returns.shape[1]} assets")
         print(f"Date range: {dates.min()} to {dates.max()}")
+        print(f"Assets: {asset_names}")
         
         # Generate rolling splits based on K, L, V data points
         splits = generate_rolling_splits(
@@ -538,6 +549,9 @@ def run_cpp_rolling_backtest(
         )
         
         print_rolling_splits(splits, K=K, L=L, V=V)
+        
+        # 📌 Initialize Portfolio objects for each method
+        portfolios = {method: Portfolio(name=method) for method in methods}
         
         # Run experiments for each split
         all_split_results = []
@@ -566,6 +580,32 @@ def run_cpp_rolling_backtest(
             )
             
             all_split_results.append(split_results)
+            
+            # 📌 Calculate realized returns for validation period and update Portfolio objects
+            validation_returns = returns_array[split['L_end_idx']:split['V_end_idx']]
+            validation_dates = dates[split['L_end_idx']:split['V_end_idx']]
+            
+            for method in methods:
+                result = split_results.get(method)
+                
+                # Only process if optimization was successful
+                if result and result['step1']['status'] == 'optimal':
+                    weights = result['step1']['weights']
+                    threshold_post = result['step2']['threshold_post']
+                    solve_time = result['step1']['solve_time']
+                    
+                    # Calculate realized return for each day in validation period
+                    for t, (date, asset_returns) in enumerate(zip(validation_dates, validation_returns)):
+                        realized_return = weights @ asset_returns  # w^T * Y_t
+                        
+                        # Add to portfolio (only record solve_time on first day of this split)
+                        portfolios[method].add_period(
+                            date=date,
+                            weight=weights,
+                            realized_return=realized_return,
+                            solve_time=solve_time if t == 0 else 0.0,
+                            threshold_post=threshold_post if t == 0 else None
+                        )
         
         # Summarize across all splits
         print(f"\n{'='*60}")
@@ -587,13 +627,68 @@ def run_cpp_rolling_backtest(
         
         # Save results
         if len(summary_df) > 0:
-            summary_df.to_csv('./results/cpp_calibrated_results.csv', index=False)
-            print("\n💾 Results saved to './results/cpp_calibrated_results.csv'")
-            print(f"📝 Log saved to '{log_file}'")
-            result = summary_df
+            summary_path = os.path.join(result_folder, 'cpp_calibrated_results.csv')
+            summary_df.to_csv(summary_path, index=False)
+            print(f"\n💾 Calibration results saved to '{summary_path}'")
         else:
-            print("\n⚠️ No valid results!")
-            result = None
+            print("\n⚠️ No valid calibration results!")
+        
+        # 📌 Calculate and display overall portfolio performance
+        print(f"\n{'='*80}")
+        print("� OVERALL PORTFOLIO PERFORMANCE (Out-of-Sample)")
+        print(f"{'='*80}")
+        
+        # Determine periods_per_year based on frequency
+        freq_to_periods = {
+            'daily': 252,
+            'weekly': 52,
+            'monthly': 12,
+            'quarterly': 4,
+            'yearly': 1
+        }
+        periods_per_year = freq_to_periods.get(frequency.lower(), 252)
+        
+        # Compare all methods
+        performance_df = compare_methods(portfolios, periods_per_year=periods_per_year)
+        
+        print("\n📈 Performance Comparison:")
+        print(performance_df.to_string())
+        
+        # Print detailed metrics for each method
+        for method in methods:
+            if len(portfolios[method]) > 0:
+                metrics = calculate_portfolio_metrics(portfolios[method], periods_per_year=periods_per_year)
+                print_portfolio_metrics(metrics, portfolio_name=method)
+        
+        # 📌 Save portfolio performance and weights
+        performance_path = os.path.join(result_folder, 'cpp_portfolio_performance.csv')
+        performance_df.to_csv(performance_path)
+        print(f"\n💾 Portfolio performance saved to '{performance_path}'")
+        
+        # 📌 Save weights for each method
+        for method in methods:
+            if len(portfolios[method]) > 0:
+                weights_df = pd.DataFrame(
+                    portfolios[method].weights,
+                    index=portfolios[method].dates,
+                    columns=asset_names
+                )
+                weights_path = os.path.join(result_folder, f'{method}_weights.csv')
+                weights_df.to_csv(weights_path)
+                print(f"💾 {method} weights saved to '{weights_path}'")
+        
+        # 📌 Create visualization plots
+        create_all_plots(portfolios, result_folder, prefix='cpp')
+        
+        print(f"\n📝 Full log saved to '{log_file}'")
+        print(f"📁 All results saved to folder: '{result_folder}'")
+        
+        result = {
+            'summary': summary_df,
+            'portfolios': portfolios,
+            'performance': performance_df,
+            'result_folder': result_folder
+        }
     
     finally:
         # Restore original stdout
