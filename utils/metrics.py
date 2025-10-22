@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 def calculate_cumulative_return(returns: np.ndarray) -> float:
     """Calculate cumulative return"""
@@ -24,12 +24,51 @@ def calculate_sharpe_ratio(returns: np.ndarray, risk_free_rate: float = 0.0,
         return 0.0
     return np.mean(excess_returns) / np.std(excess_returns, ddof=1) * np.sqrt(periods_per_year)
 
+def calculate_sortino_ratio(returns: np.ndarray, risk_free_rate: float = 0.0, 
+                            periods_per_year: int = 252) -> float:
+    """
+    Calculate annualized Sortino ratio
+    
+    Args:
+        returns: Array of periodic returns
+        risk_free_rate: Annual risk-free rate (target return)
+        periods_per_year: Number of periods per year
+        
+    Returns:
+        Annualized Sortino ratio
+    """
+    
+    excess_returns = returns - risk_free_rate / periods_per_year
+    avg_periodic_excess_return = np.mean(excess_returns)
+    
+    downside_squares = np.where(excess_returns < 0, excess_returns**2, 0.0)
+    mean_downside_squares = np.mean(downside_squares)
+    
+    periodic_downside_deviation = np.sqrt(mean_downside_squares)
+    
+    if periodic_downside_deviation == 0:
+        return 0.0
+
+    sortino_ratio = (avg_periodic_excess_return / periodic_downside_deviation) * np.sqrt(periods_per_year)
+    
+    return sortino_ratio
+
 def calculate_max_drawdown(returns: np.ndarray) -> float:
     """Calculate maximum drawdown"""
     cumulative = np.cumprod(1 + returns)
     running_max = np.maximum.accumulate(cumulative)
     drawdown = (cumulative - running_max) / running_max
     return np.min(drawdown)
+
+def calculate_calmar_ratio(returns: np.ndarray, periods_per_year: int = 252) -> float:
+    """Calculate Calmar ratio"""
+    annualized_return = calculate_annualized_return(returns, periods_per_year)
+    max_drawdown = calculate_max_drawdown(returns)
+    
+    if max_drawdown == 0.0:
+        return np.nan
+        
+    return annualized_return / abs(max_drawdown)
 
 def calculate_turnover(weights_history) -> float:
     """
@@ -54,6 +93,25 @@ def calculate_turnover(weights_history) -> float:
         turnovers.append(turnover)
     
     return np.mean(turnovers)
+
+def calculate_var_cvar(returns: np.ndarray, confidence_level: float = 0.95) -> Tuple[float, float]:
+    """
+    Calculate Value at Risk (VaR) and Conditional VaR (CVaR)
+    
+    Args:
+        returns: Array of periodic returns
+        confidence_level: Confidence level (e.g., 0.95, 0.99)
+        
+    Returns:
+        (var, cvar): Tuple of VaR and CVaR
+    """
+    
+    alpha = (1 - confidence_level) * 100
+    
+    var = np.percentile(returns, alpha)
+    cvar = returns[returns <= var].mean()
+    
+    return var, cvar
 
 
 def calculate_portfolio_metrics(portfolio, 
@@ -81,7 +139,11 @@ def calculate_portfolio_metrics(portfolio,
             'volatility': 0.0,
             'sharpe_ratio': 0.0,
             'max_drawdown': 0.0,
+            'sortino_ratio': 0.0,
+            'calmar ratio': 0.0,
             'turnover': 0.0,
+            'VaR': 0.0,
+            'CVaR': 0.0,
             'avg_solve_time': 0.0,
             'total_solve_time': 0.0
         }
@@ -93,7 +155,10 @@ def calculate_portfolio_metrics(portfolio,
     metrics['volatility'] = calculate_volatility(returns, periods_per_year)
     metrics['sharpe_ratio'] = calculate_sharpe_ratio(returns, risk_free_rate, periods_per_year)
     metrics['max_drawdown'] = calculate_max_drawdown(returns)
-    metrics['turnover'] = calculate_turnover(weights)  # Pass numpy array directly
+    metrics['sortino_ratio'] = calculate_sortino_ratio(returns, risk_free_rate, periods_per_year)
+    metrics['calmar_ratio'] = calculate_calmar_ratio(returns, periods_per_year)
+    metrics['turnover'] = calculate_turnover(weights)
+    metrics['VaR'], metrics['CVaR'] = calculate_var_cvar(returns, confidence_level=0.95)
     
     # Computational metrics
     solve_times = [t for t in portfolio.solve_times if t > 0]  # Only non-zero solve times
@@ -138,8 +203,8 @@ def compare_methods(portfolios: Dict[str, Any],
     # Reorder columns for better readability
     column_order = [
         'n_periods', 'cumulative_return', 'annualized_return', 'volatility',
-        'sharpe_ratio', 'max_drawdown', 'turnover', 
-        'avg_solve_time', 'total_solve_time'
+        'sharpe_ratio', 'max_drawdown', 'sortino_raio', 'calmar_ratio', 'turnover', 
+        'VaR', 'CVaR', 'avg_solve_time', 'total_solve_time'
     ]
     
     # Add CPP-specific columns if they exist
@@ -168,6 +233,10 @@ def print_portfolio_metrics(metrics: Dict, portfolio_name: str = "Portfolio"):
     print(f"  Volatility (Ann.):    {metrics['volatility']:>10.2%}")
     print(f"  Sharpe Ratio:         {metrics['sharpe_ratio']:>10.4f}")
     print(f"  Max Drawdown:         {metrics['max_drawdown']:>10.2%}")
+    print(f"  Sortino Ratio:        {metrics['sortino_ratio']:>10.4f}")
+    print(f"  Calmar Ratio:         {metrics['calmar_ratio']:>10.4f}")
+    print(f"  VaR:        {metrics['VaR']:>10.4f}")
+    print(f"  Conditional VaR:         {metrics['CVaR']:>10.4f}")    
     
     print(f"\n💼 Trading Metrics:")
     print(f"  Avg Turnover:         {metrics['turnover']:>10.2%}")

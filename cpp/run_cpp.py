@@ -10,20 +10,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from typing import Tuple, List, Dict
-import time
 from datetime import datetime
 
 from data.data_loader import TimeSeriesDataLoader
 from utils.portfolios import Portfolio
 from utils.metrics import calculate_portfolio_metrics, compare_methods, print_portfolio_metrics
 from utils.visualization import create_all_plots
-from utils.evaluate import generate_rolling_splits, print_rolling_splits, aggregate_metrics_across_splits, print_aggregated_metrics
+from utils.evaluate import generate_rolling_splits, print_rolling_splits
 
 # Import cpp solver framework
 sys.path.append(os.path.join(os.path.dirname(__file__)))
 from solver import solve
-from config import config_basic as config
-
+from configs import config_basic as config
 
 # Logging utility
 class Logger:
@@ -526,10 +524,10 @@ def run_cpp_rolling_backtest(
         # Load data
         print("\nLoading data...")
         loader = TimeSeriesDataLoader(data_path=data_path)
-        loader.preprocess_data()
-        data_resampled = loader.resample_frequency(loader.processed_data, frequency)
+        loader.load_data()  # Load raw price data (do NOT preprocess with StandardScaler)
+        data_resampled = loader.resample_frequency(loader.raw_data, frequency)
         
-        # Convert to returns
+        # Convert to returns (from raw prices)
         returns = data_resampled.pct_change().dropna()
         returns_array = returns.values
         dates = returns.index

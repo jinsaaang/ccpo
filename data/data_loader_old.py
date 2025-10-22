@@ -97,82 +97,12 @@ class TimeSeriesDataLoader:
         
         X = np.array(X)
         y = np.array(y)
-        print(f"Created sequences - X: {X.shape}, y: {y.shape}")
-        return X, y, pred_dates
-    
-    def create_sequences_KLV(self,
-                            data: pd.DataFrame,
-                            lookback: int,
-                            K: int,
-                            L: int, 
-                            V: int,
-                            start_idx: int = 0,
-                            forecast_horizon: int = 1) -> Tuple:
-        """
-        Create sequences for K-L-V split with proper scaling
         
-        Args:
-            data: Raw price data (NOT scaled)
-            lookback: History window size
-            K, L, V: Train/Calibration/Validation sizes
-            start_idx: Starting index for rolling window
-            forecast_horizon: Prediction horizon
-            
-        Returns:
-            X_K, X_L, X_V: Input sequences
-            y_K, y_L, y_V: Target values
-            dates_K, dates_L, dates_V: Corresponding dates
-            scaler: Fitted scaler (on lookback+K only)
-        """
-        total_needed = lookback + K + L + V
-        end_idx = start_idx + total_needed
-        
-        if end_idx > len(data):
-            raise ValueError(f"Not enough data: need {total_needed}, got {len(data) - start_idx}")
-        
-        # Extract window data
-        window_data = data.iloc[start_idx:end_idx]
-        
-        # Fit scaler on lookback + K only (training data)
-        train_cutoff = lookback + K
-        scaler = StandardScaler()
-        scaler.fit(window_data.iloc[:train_cutoff].values)
-        
-        # Transform entire window
-        scaled_values = scaler.transform(window_data.values)
-        scaled_data = pd.DataFrame(
-            scaled_values,
-            index=window_data.index,
-            columns=window_data.columns
-        )
-        
-        # Create sequences
-        X, y, pred_dates = [], [], []
-        for i in range(lookback, len(scaled_data) - forecast_horizon + 1):
-            X.append(scaled_values[i-lookback:i])
-            y.append(scaled_values[i:i+forecast_horizon])
-            pred_dates.append(scaled_data.index[i+forecast_horizon-1])
-        
-        X = np.array(X)
-        y = np.array(y)
         if forecast_horizon == 1:
             y = y.squeeze(1)
         
-        # Split into K, L, V
-        X_K = X[:K]
-        X_L = X[K:K+L]
-        X_V = X[K+L:K+L+V]
-        
-        y_K = y[:K]
-        y_L = y[K:K+L]
-        y_V = y[K+L:K+L+V]
-        
-        dates_K = pred_dates[:K]
-        dates_L = pred_dates[K:K+L]
-        dates_V = pred_dates[K+L:K+L+V]
-        
-        return (X_K, X_L, X_V, y_K, y_L, y_V, 
-                dates_K, dates_L, dates_V, scaler)
+        print(f"Created sequences - X: {X.shape}, y: {y.shape}")
+        return X, y, pred_dates
     
     def split_by_date(self,
                      X: np.ndarray,
