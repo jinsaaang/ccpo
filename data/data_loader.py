@@ -113,8 +113,8 @@ class TimeSeriesDataLoader:
         
         Args:
             data: Raw price data (NOT scaled)
-            lookback: History window size
-            K, L, V: Train/Calibration/Validation sizes
+            lookback: History window size (LSTM input window, used within K/L/V data)
+            K, L, V: Train/Calibration/Validation sizes (number of sequences/samples)
             start_idx: Starting index for rolling window
             forecast_horizon: Prediction horizon
             
@@ -122,9 +122,16 @@ class TimeSeriesDataLoader:
             X_K, X_L, X_V: Input sequences
             y_K, y_L, y_V: Target values
             dates_K, dates_L, dates_V: Corresponding dates
-            scaler: Fitted scaler (on lookback+K only)
+            scaler: Fitted scaler (on training data only)
+            
+        Note:
+            - lookback is LSTM input window, used WITHIN K/L/V data
+            - K samples use the first K data points (with lookback from within K)
+            - Total price data needed: K + L + V (lookback does NOT add extra data)
         """
-        total_needed = lookback + K + L + V
+        # Total price data points needed:
+        # K, L, V only (lookback windows come from within these periods)
+        total_needed = K + L + V
         end_idx = start_idx + total_needed
         
         if end_idx > len(data):
@@ -133,24 +140,36 @@ class TimeSeriesDataLoader:
         # Extract window data
         window_data = data.iloc[start_idx:end_idx]
         
-        # Fit scaler on lookback + K only (training data)
-        train_cutoff = lookback + K
+        # ⚠️ IMPORTANT: Convert price to returns for CCPO
+        # CCPO predicts returns, not prices!
+        returns_data = window_data.pct_change().dropna()
+        
+        # Adjust indices after dropna (lost 1 row)
+        # We need to ensure we still have enough data
+        if len(returns_data) < total_needed - 1:
+            raise ValueError(f"Not enough data after returns conversion: need {total_needed-1}, got {len(returns_data)}")
+        
+        # Fit scaler on training data only (first K returns)
+        # This ensures no data leakage from L or V sets
+        train_cutoff = K - 1  # -1 because we lost 1 row to pct_change
         scaler = StandardScaler()
-        scaler.fit(window_data.iloc[:train_cutoff].values)
+        scaler.fit(returns_data.iloc[:train_cutoff].values)
         
         # Transform entire window
-        scaled_values = scaler.transform(window_data.values)
+        scaled_values = scaler.transform(returns_data.values)
         scaled_data = pd.DataFrame(
             scaled_values,
-            index=window_data.index,
-            columns=window_data.columns
+            index=returns_data.index,
+            columns=returns_data.columns
         )
         
         # Create sequences
+        # We create sequences starting from index 'lookback' within the data
+        # This means first K-lookback sequences come from K period
         X, y, pred_dates = [], [], []
         for i in range(lookback, len(scaled_data) - forecast_horizon + 1):
-            X.append(scaled_values[i-lookback:i])
-            y.append(scaled_values[i:i+forecast_horizon])
+            X.append(scaled_values[i-lookback:i])  # lookback-length input window
+            y.append(scaled_values[i:i+forecast_horizon])  # forecast target
             pred_dates.append(scaled_data.index[i+forecast_horizon-1])
         
         X = np.array(X)
@@ -158,18 +177,21 @@ class TimeSeriesDataLoader:
         if forecast_horizon == 1:
             y = y.squeeze(1)
         
-        # Split into K, L, V
-        X_K = X[:K]
-        X_L = X[K:K+L]
-        X_V = X[K+L:K+L+V]
+        # Total sequences created: K + L + V - lookback
+        # Split into K, L, V sequences
+        # K gets first (K-lookback) sequences
+        K_seq = K - lookback
+        X_K = X[:K_seq]
+        X_L = X[K_seq:K_seq+L]
+        X_V = X[K_seq+L:K_seq+L+V]
         
-        y_K = y[:K]
-        y_L = y[K:K+L]
-        y_V = y[K+L:K+L+V]
+        y_K = y[:K_seq]
+        y_L = y[K_seq:K_seq+L]
+        y_V = y[K_seq+L:K_seq+L+V]
         
-        dates_K = pred_dates[:K]
-        dates_L = pred_dates[K:K+L]
-        dates_V = pred_dates[K+L:K+L+V]
+        dates_K = pred_dates[:K_seq]
+        dates_L = pred_dates[K_seq:K_seq+L]
+        dates_V = pred_dates[K_seq+L:K_seq+L+V]
         
         return (X_K, X_L, X_V, y_K, y_L, y_V, 
                 dates_K, dates_L, dates_V, scaler)

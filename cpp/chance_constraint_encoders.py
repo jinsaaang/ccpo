@@ -9,8 +9,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from pyscipopt import quicksum
-from robust_conformal_prediction import *
-from config import config_basic as config
+from .robust_conformal_prediction import *
+from configs import config_basic as config
 
 
 # # Hyperparameter setting:

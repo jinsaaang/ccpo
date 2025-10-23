@@ -69,3 +69,68 @@ class Portfolio:
     
     def __repr__(self):
         return f"Portfolio(name='{self.name}', n_periods={len(self)})"
+
+
+class EqualWeightPortfolio:
+    """
+    Equal Weight (1/N) Portfolio - Simple baseline strategy
+    Allocates equal weight to all assets
+    """
+    
+    def __init__(self, n_assets: int, name: str = "Equal-Weight"):
+        """
+        Args:
+            n_assets: Number of assets in the portfolio
+            name: Name of the portfolio
+        """
+        self.n_assets = n_assets
+        self.name = name
+        self.weights = np.ones(n_assets) / n_assets  # Equal weights
+        
+    def get_weights(self) -> np.ndarray:
+        """Return equal weights"""
+        return self.weights
+    
+    def rebalance(self, *args, **kwargs) -> np.ndarray:
+        """
+        Rebalancing is trivial for equal weight - always return same weights
+        This method exists for compatibility with other portfolio strategies
+        """
+        return self.weights
+    
+    def __repr__(self):
+        return f"EqualWeightPortfolio(n_assets={self.n_assets}, name='{self.name}')"
+
+
+def create_equal_weight_portfolio(
+    returns_array: np.ndarray,
+    dates: pd.DatetimeIndex,
+    name: str = "Equal-Weight"
+) -> Portfolio:
+    """
+    Create a Portfolio object with equal weight strategy
+    
+    Args:
+        returns_array: Asset returns (n_periods x n_assets)
+        dates: Dates for each period
+        name: Portfolio name
+        
+    Returns:
+        Portfolio object with equal weight allocations
+    """
+    n_periods, n_assets = returns_array.shape
+    equal_weights = np.ones(n_assets) / n_assets
+    
+    portfolio = Portfolio(name=name)
+    
+    for i, date in enumerate(dates):
+        realized_return = equal_weights @ returns_array[i]
+        portfolio.add_period(
+            date=date,
+            weight=equal_weights,
+            realized_return=realized_return,
+            solve_time=0.0,
+            threshold_post=None
+        )
+    
+    return portfolio

@@ -9,67 +9,122 @@ def generate_rolling_splits(
     K: int,
     L: int,
     V: int,
-    step_size: int = None
+    step_size: int = None,
+    expanding_window: bool = False,
+    K_max: int = None
 ) -> List[Dict]:
     """
-    Generate rolling window splits by data points (K, L, V)
+    Generate rolling or expanding window splits by data points (K, L, V)
     
     Args:
         dates: DatetimeIndex of the data
-        K: Number of data points for optimization (train)
+        K: Initial number of data points for optimization (train)
         L: Number of data points for calibration (val)
         V: Number of data points for validation (test)
         step_size: How many points to move forward for each split (default: V)
+        expanding_window: If True, K grows over time (K_start stays at 0)
+        K_max: Maximum size for K in expanding window mode (None = unlimited)
         
     Returns:
         List of dicts with 'K_start_idx', 'K_end_idx', 'L_end_idx', 'V_end_idx',
-        'K_start_date', 'K_end_date', 'L_end_date', 'V_end_date'
+        'K_start_date', 'K_end_date', 'L_end_date', 'V_end_date', 'K_size'
         
     Example:
+        Rolling window (expanding_window=False):
         If K=100, L=50, V=50, step_size=50:
-        - Split 1: indices [0:100], [100:150], [150:200]
-        - Split 2: indices [50:150], [150:200], [200:250]
-        - ...
+        - Split 1: K=[0:100], L=[100:150], V=[150:200]
+        - Split 2: K=[50:150], L=[150:200], V=[200:250]
+        
+        Expanding window (expanding_window=True):
+        If K=100, L=50, V=50, step_size=50:
+        - Split 1: K=[0:100], L=[100:150], V=[150:200]
+        - Split 2: K=[0:150], L=[150:200], V=[200:250]
+        - Split 3: K=[0:200], L=[200:250], V=[250:300]
     """
     if step_size is None:
         step_size = V  # Default: move forward by V points
     
-    total_window = K + L + V
     n_data = len(dates)
     
+    # Check initial window size
+    total_window = K + L + V
     if n_data < total_window:
         raise ValueError(f"Not enough data. Need {total_window} points, got {n_data}")
     
     splits = []
-    current_start = 0
     
-    while True:
-        K_start_idx = current_start
-        K_end_idx = current_start + K
-        L_end_idx = K_end_idx + L
-        V_end_idx = L_end_idx + V
+    if expanding_window:
+        # Expanding window: K_start stays at 0, K grows
+        K_start_idx = 0
+        current_end = K  # Start with initial K size
         
-        # Check if we have enough data for full split
-        if V_end_idx > n_data:
-            break
+        while True:
+            # Determine K size (with optional cap)
+            K_current = current_end - K_start_idx
+            if K_max is not None:
+                K_current = min(K_current, K_max)
+                K_end_idx = K_start_idx + K_current
+            else:
+                K_end_idx = current_end
+            
+            L_end_idx = K_end_idx + L
+            V_end_idx = L_end_idx + V
+            
+            # Check if we have enough data for full split
+            if V_end_idx > n_data:
+                break
+            
+            split = {
+                # Indices (end is exclusive)
+                'K_start_idx': K_start_idx,
+                'K_end_idx': K_end_idx,
+                'L_end_idx': L_end_idx,
+                'V_end_idx': V_end_idx,
+                'K_size': K_current,
+                # Dates
+                'K_start_date': dates[K_start_idx].strftime('%Y-%m-%d'),
+                'K_end_date': dates[K_end_idx - 1].strftime('%Y-%m-%d'),
+                'L_end_date': dates[L_end_idx - 1].strftime('%Y-%m-%d'),
+                'V_end_date': dates[V_end_idx - 1].strftime('%Y-%m-%d'),
+            }
+            
+            splits.append(split)
+            
+            # Move forward
+            current_end += step_size
+    
+    else:
+        # Rolling window: standard sliding window
+        current_start = 0
         
-        split = {
-            # Indices (end is exclusive)
-            'K_start_idx': K_start_idx,
-            'K_end_idx': K_end_idx,
-            'L_end_idx': L_end_idx,
-            'V_end_idx': V_end_idx,
-            # Dates
-            'K_start_date': dates[K_start_idx].strftime('%Y-%m-%d'),
-            'K_end_date': dates[K_end_idx - 1].strftime('%Y-%m-%d'),
-            'L_end_date': dates[L_end_idx - 1].strftime('%Y-%m-%d'),
-            'V_end_date': dates[V_end_idx - 1].strftime('%Y-%m-%d'),
-        }
-        
-        splits.append(split)
-        
-        # Move forward
-        current_start += step_size
+        while True:
+            K_start_idx = current_start
+            K_end_idx = current_start + K
+            L_end_idx = K_end_idx + L
+            V_end_idx = L_end_idx + V
+            
+            # Check if we have enough data for full split
+            if V_end_idx > n_data:
+                break
+            
+            split = {
+                # Indices (end is exclusive)
+                'K_start_idx': K_start_idx,
+                'K_end_idx': K_end_idx,
+                'L_end_idx': L_end_idx,
+                'V_end_idx': V_end_idx,
+                'K_size': K,
+                # Dates
+                'K_start_date': dates[K_start_idx].strftime('%Y-%m-%d'),
+                'K_end_date': dates[K_end_idx - 1].strftime('%Y-%m-%d'),
+                'L_end_date': dates[L_end_idx - 1].strftime('%Y-%m-%d'),
+                'V_end_date': dates[V_end_idx - 1].strftime('%Y-%m-%d'),
+            }
+            
+            splits.append(split)
+            
+            # Move forward
+            current_start += step_size
     
     return splits
 

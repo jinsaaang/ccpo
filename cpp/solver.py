@@ -4,7 +4,7 @@ In this file, we write the solver for the CCO/RCCO/JCCO problems, which calls th
 
 # Import necessary modules.
 import time
-from chance_constraint_encoders import *
+from .chance_constraint_encoders import *
 from pyscipopt import Model
 # import configuration as config
 

@@ -20,7 +20,7 @@ from utils.evaluate import generate_rolling_splits, print_rolling_splits
 
 # Import cpp solver framework
 sys.path.append(os.path.join(os.path.dirname(__file__)))
-from solver import solve
+from .solver import solve
 from configs import config_basic as config
 
 # Logging utility

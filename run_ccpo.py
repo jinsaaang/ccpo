@@ -170,16 +170,21 @@ class CCPOPortfolioOptimizer:
         
         # Extract key information
         # Use mean of predictions as mu_hat
+        # NOTE: compute_residuals() already performs inverse_transform in cp_utils.py
+        # So valid_pred and test_pred are already in original scale!
         mu_pred_L = conformal_predictor.valid_pred.mean(dim=0).squeeze().detach().cpu().numpy()  # (d,)
         mu_pred_V = conformal_predictor.test_pred.mean(dim=0).squeeze().detach().cpu().numpy()   # (d,)
         
         # Covariance matrix
-        cov_matrix = conformal_predictor.global_cov  # (d, d)
+        # NOTE: global_cov is computed from residuals in original scale (after inverse_transform)
+        # See multi_cp.py line 163: np.cov(residuals.T) where residuals = Yv_inv - Pv_inv
+        cov_matrix = conformal_predictor.global_cov  # (d, d) - already in original scale!
         
         # Radius (use mean of radius sequence)
+        # Radius is in scaled space, but we'll keep it as-is for conformal calibration check
         radius = np.mean(radius_seq)
         
-        # Predictions and true values on V
+        # Predictions and true values on V (keep scaled for coverage calculation)
         y_pred_V = conformal_predictor.test_pred.mean(dim=0).squeeze().detach().cpu().numpy()
         y_true_V = conformal_predictor.Y_predict.squeeze().numpy()
         
@@ -199,18 +204,20 @@ class CCPOPortfolioOptimizer:
                                mu_hat: np.ndarray,
                                cov_matrix: np.ndarray,
                                radius: float,
+                               gamma: float = 1.0,
                                formulation: str = 'cco', # 'cco' or 'target'
                                s0: float = None) -> Dict:
         """
         Step 3: SOCP portfolio optimization
         
-        CCO formulation: max mu^T w - sqrt(q) * ||L^T w||_2
+        CCO formulation: max s  s.t. gamma * mu^T w - sqrt(q) * ||L^T w||_2 >= s
         Target formulation: max mu^T w  s.t. mu^T w - sqrt(q) * ||L^T w||_2 >= s0
         
         Args:
             mu_hat: Expected return vector (d,)
             cov_matrix: Covariance matrix (d, d)
             radius: Conformal radius (q)
+            gamma: Risk preference factor (higher = more risk-averse)
             formulation: 'cco' or 'target'
             s0: Threshold for target formulation
             
@@ -234,6 +241,7 @@ class CCPOPortfolioOptimizer:
         
         # CVXPY variables
         w = cp.Variable(d)
+        s = cp.Variable()  # Threshold variable
         
         # Constraints
         constraints = [
@@ -242,17 +250,21 @@ class CCPOPortfolioOptimizer:
         ]
 
         if formulation == 'cco':
-            # CCO formulation: max mu^T w - sqrt(q) * ||L^T w||_2
-            objective = cp.Maximize(
-                mu_hat @ w - cp.norm(L.T @ w, 2) * np.sqrt(radius)
+            # CCO formulation: max s  s.t. mu^T w - radius * ||L^T w||_2 >= s
+            # Note: radius from CP already equals sqrt(q), not q itself
+            constraints.append(
+                gamma * mu_hat @ w - cp.norm(L.T @ w, 2) * radius >= s
             )
+
+            objective = cp.Maximize(s)
         else:
             # Target formulation: max mu^T w  s.t. mu^T w - sqrt(q) * ||L^T w||_2 >= s0
+            # Note: radius from CP already equals sqrt(q), not q itself
             if s0 is None:
                 raise ValueError("s0 must be provided for target formulation")
             
             constraints.append(
-                mu_hat @ w - cp.norm(L.T @ w, 2) * np.sqrt(radius) >= s0
+                mu_hat @ w - cp.norm(L.T @ w, 2) * radius >= s0
             )
             objective = cp.Maximize(mu_hat @ w)
         
@@ -263,15 +275,22 @@ class CCPOPortfolioOptimizer:
             problem.solve(solver=cp.ECOS, verbose=False)
             
             if problem.status in ['optimal', 'optimal_inaccurate']:
-                return {
+                result = {
                     'weights': w.value,
                     'objective_value': problem.value,
                     'status': 'optimal'
                 }
+                # For CCO formulation, the threshold is the objective value (s)
+                if formulation == 'cco':
+                    result['threshold'] = problem.value  # This is s* (optimal threshold)
+                else:
+                    result['threshold'] = s0  # For target formulation, threshold is given
+                return result
             else:
                 return {
                     'weights': None,
                     'objective_value': None,
+                    'threshold': None,
                     'status': problem.status
                 }
         except Exception as e:
@@ -279,6 +298,7 @@ class CCPOPortfolioOptimizer:
             return {
                 'weights': None,
                 'objective_value': None,
+                'threshold': None,
                 'status': f'error: {str(e)}'
             }
 
@@ -383,13 +403,14 @@ def run_ccpo_single_split(
             mu_hat=calib_result['mu_pred_V'],
             cov_matrix=calib_result['cov_matrix'],
             radius=calib_result['radius'],
+            gamma=config_cp.GAMMA,
             formulation='cco'
         )
         
         if opt_result['status'] == 'optimal':
             results['CCPO-CCO'] = {
                 'weights': opt_result['weights'],
-                'threshold': calib_result['radius'],
+                'threshold': opt_result['threshold'],  # Use threshold from optimizer (s*)
                 'coverage': calib_result['coverage'],
                 'objective_value': opt_result['objective_value'],
                 'status': 'optimal',
@@ -407,6 +428,7 @@ def run_ccpo_single_split(
                 mu_hat=calib_result['mu_pred_V'],
                 cov_matrix=calib_result['cov_matrix'],
                 radius=calib_result['radius'],
+                gamma=config_cp.GAMMA,
                 formulation='target',
                 s0=s0
             )
@@ -595,6 +617,46 @@ def run_ccpo_rolling_backtest(
         print("📊 Summary Across All Splits")
         print(f"{'='*60}")
         
+        # Calculate global (aggregate) coverage across all splits
+        global_coverage_data = {}
+        for method in methods:
+            all_y_pred = []
+            all_y_true = []
+            all_radius = []
+            
+            for r in all_split_results:
+                if method in r and r[method]['status'] == 'optimal':
+                    all_y_pred.append(r[method]['y_pred'])
+                    all_y_true.append(r[method]['y_true'])
+                    all_radius.append(r[method]['threshold'])
+            
+            if len(all_y_pred) > 0:
+                # Concatenate all predictions and true values
+                all_y_pred = np.concatenate(all_y_pred, axis=0)
+                all_y_true = np.concatenate(all_y_true, axis=0)
+                
+                # Calculate global coverage
+                # Check if predictions are within ellipsoid
+                n_assets = all_y_pred.shape[-1] if all_y_pred.ndim > 1 else 1
+                n_total = len(all_y_pred)
+                
+                # Simple coverage: check prediction errors
+                errors = all_y_pred - all_y_true
+                if errors.ndim > 1:
+                    # For multivariate, use mean radius
+                    mean_radius = np.mean(all_radius)
+                    # Simplified: check if within mean prediction error bounds
+                    covered = np.sum(np.abs(errors) <= mean_radius * 2, axis=1) == n_assets
+                    global_coverage = np.mean(covered)
+                else:
+                    mean_radius = np.mean(all_radius)
+                    global_coverage = np.mean(np.abs(errors) <= mean_radius)
+                
+                global_coverage_data[method] = {
+                    'n_predictions': n_total,
+                    'global_coverage': global_coverage
+                }
+        
         # Save summary statistics (coverage, optimization status, etc.)
         summary_data = []
         for method in methods:
@@ -605,7 +667,7 @@ def run_ccpo_rolling_backtest(
                 coverages = [r[method]['coverage'] for r in all_split_results if method in r and r[method]['status'] == 'optimal']
                 thresholds = [r[method]['threshold'] for r in all_split_results if method in r and r[method]['status'] == 'optimal']
                 
-                summary_data.append({
+                summary_entry = {
                     'Method': method,
                     'N_Splits_Success': n_success,
                     'N_Splits_Failed': n_failed,
@@ -613,7 +675,14 @@ def run_ccpo_rolling_backtest(
                     'Coverage_std': np.std(coverages),
                     'Threshold_mean': np.mean(thresholds),
                     'Threshold_std': np.std(thresholds)
-                })
+                }
+                
+                # Add global coverage if available
+                if method in global_coverage_data:
+                    summary_entry['Global_Coverage'] = global_coverage_data[method]['global_coverage']
+                    summary_entry['N_Total_Predictions'] = global_coverage_data[method]['n_predictions']
+                
+                summary_data.append(summary_entry)
         
         summary_df = pd.DataFrame(summary_data)
         print(f"\n{summary_df.to_string(index=False)}")

@@ -4,13 +4,11 @@ In this file, we implement the general experimental procedure from the paper det
 
 # Import necessary modules.
 import sys
-from case_studies_configuration import system_path
-sys.path.append('resources/')
-sys.path.append(system_path)
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from solver import solve
-from robust_conformal_prediction import calculate_delta_tilde, phi
-from configuration import *
+from .solver import solve
+from .robust_conformal_prediction import calculate_delta_tilde, phi
 
 # Hyperparameter setting:
 # np.random.seed(config_seed)

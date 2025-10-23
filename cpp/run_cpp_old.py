@@ -19,7 +19,7 @@ from utils.evaluate import generate_rolling_splits, print_rolling_splits, aggreg
 
 # Import cpp solver framework
 sys.path.append(os.path.join(os.path.dirname(__file__)))
-from solver import solve
+from .solver import solve
 
 
 class CPPPortfolioOptimizer:
