@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Dict, List
 
 # Import unified config
-from configs import config_revised_prev as config
+from configs import config_revised as config
 
 # Import portfolio utilities
 from utils.portfolios import Portfolio
@@ -136,7 +136,6 @@ def aggregate_and_save_results(
     performance_df.to_csv(performance_path)
     print(f"\n💾 Performance comparison saved to '{performance_path}'")
 
-    # 가중치 저장
     for method in all_methods:
         if len(portfolios[method]) > 0:
             weights_df = pd.DataFrame(
@@ -148,7 +147,6 @@ def aggregate_and_save_results(
             weights_df.to_csv(weights_path)
             print(f"💾 {method} weights saved to '{weights_path}' ({len(weights_df)} periods)")
 
-    # 요약 저장 (결과가 있는 경우, 주로 'direct' 모드용)
     if results:
         summary_rows = []
         for method in all_methods:
@@ -172,7 +170,6 @@ def aggregate_and_save_results(
             summary_df.to_csv(summary_path, index=False)
             print(f"💾 Summary saved to '{summary_path}'")
 
-        # CCPO 캘리브레이션 상세 저장
         if "CCPO-CCO" in results and "coverage_seq" in results["CCPO-CCO"]:
             c = results["CCPO-CCO"]
             ccpo_calib_df = pd.DataFrame(
@@ -191,3 +188,11 @@ def aggregate_and_save_results(
     create_all_plots(valid_portfolios, result_folder, prefix=prefix)
     
     print(f"\n📁 All results saved to: {result_folder}")
+    
+
+def datestr(x):
+    """안전하게 YYYY-MM-DD 문자열로 변환"""
+    try:
+        return pd.Timestamp(x).date().isoformat()
+    except Exception:
+        return str(x)

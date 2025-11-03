@@ -248,11 +248,8 @@ def run_ccpo_direct(
                            print(f"      Warning: Unexpected prediction shape {pred_scaled.shape}")
                       predictions.append(pred_scaled)
 
-            # Average predictions (still scaled)
             mean_pred_scaled = torch.stack(predictions).mean(dim=0) # Shape: (1, n_assets)
-
-            # Inverse transform to get mu_hat in original scale
-            mu_pred_raw = loader.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
+            mu_pred_raw = scaler.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
 
             # Optimize portfolio using mu_hat (raw), cov_matrix (raw), radius (calibrated)
             opt_result = optimizer.optimize_portfolio_socp(
@@ -303,7 +300,7 @@ def run_ccpo_direct(
 
 
 # ============================================================================
-# CCPO RUNNER (Rolling - COUNTS) - 수정됨
+# CCPO RUNNER (Rolling - COUNTS)
 # ============================================================================
 
 def run_ccpo_rolling_counts(
@@ -339,7 +336,7 @@ def run_ccpo_rolling_counts(
             lookback=cfg.LOOKBACK,
             train_len=model_train_len, # Model Train length
             K=K_len,                 # Model Valid/Calib (K) length
-            V=0,                     # We handle V manually using V_returns_raw
+            V=V_len,                     # We handle V manually using V_returns_raw
             start_idx=start_idx,       # Starting index for the raw data window
             batch_size=cfg.CCPO.BATCH_SIZE, # Use CCPO batch size for model loading
             shuffle_train=True,
@@ -349,7 +346,7 @@ def run_ccpo_rolling_counts(
 
         train_loader = res['model']['train_loader']
         valid_loader = res['model']['valid_loader'] # K period for Calibration
-        # test_loader is empty because V=0
+        test_loader = res['model']['test_loader']
         scaler = res['scaler'] # Scaler fitted on Train period raw data
 
         if len(train_loader.dataset) == 0 or len(valid_loader.dataset) == 0:
@@ -368,10 +365,9 @@ def run_ccpo_rolling_counts(
 
         X_train, Y_train = train_loader.dataset.X, train_loader.dataset.y
         X_valid, Y_valid = valid_loader.dataset.X, valid_loader.dataset.y # K data
-
-        # Need a placeholder for X_predict in SPCI_and_EnbPI if V=0
-        X_predict, Y_predict = X_valid.clone(), Y_valid.clone()
-
+        X_predict, Y_predict = test_loader.dataset.X, test_loader.dataset.y # V data
+                
+        
         conformal_predictor = SPCI_and_EnbPI(
             X_train, X_valid, X_predict,
             Y_train, Y_valid, Y_predict,
@@ -399,6 +395,7 @@ def run_ccpo_rolling_counts(
 
         mean_coverage_calib, _, _, _, radius_seq = conformal_predictor.get_results()
         if not radius_seq: raise ValueError("Calibration failed: Radius sequence is empty.")
+        
         radius = float(np.mean(radius_seq))
         cov_matrix = conformal_predictor.global_cov
 
@@ -443,7 +440,7 @@ def run_ccpo_rolling_counts(
                     predictions.append(pred_scaled)
 
             mean_pred_scaled = torch.stack(predictions).mean(dim=0)
-            mu_pred_raw = loader.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
+            mu_pred_raw = scaler.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
 
             opt_result = optimizer.optimize_portfolio_socp(
                 mu_hat=mu_pred_raw, cov_matrix=cov_matrix, radius=radius,
@@ -486,7 +483,7 @@ def run_ccpo_rolling_counts(
 
 
 # ============================================================================
-# CCPO RUNNER
+# CCPO RUNNER (Rolling - DATES)
 # ============================================================================
 
 def run_ccpo_rolling_dates(
@@ -538,6 +535,7 @@ def run_ccpo_rolling_dates(
 
         train_loader = res['model']['train_loader']
         valid_loader = res['model']['valid_loader'] # K period for Calibration
+        test_loader = res['model']['test_loader']
         scaler = res['scaler'] # Scaler fitted on Train period raw data
 
         if len(train_loader.dataset) == 0 or len(valid_loader.dataset) == 0:
@@ -557,8 +555,7 @@ def run_ccpo_rolling_dates(
 
         X_train, Y_train = train_loader.dataset.X, train_loader.dataset.y
         X_valid, Y_valid = valid_loader.dataset.X, valid_loader.dataset.y # K data
-
-        X_predict, Y_predict = X_valid.clone(), Y_valid.clone() # Placeholder
+        X_predict, Y_predict = test_loader.dataset.X, test_loader.dataset.y # V data
 
         conformal_predictor = SPCI_and_EnbPI(
             X_train, X_valid, X_predict,
@@ -589,7 +586,8 @@ def run_ccpo_rolling_dates(
         if not radius_seq: raise ValueError("Calibration failed: Radius sequence is empty.")
         # radius = float(np.mean(radius_seq))
         cov_matrix = conformal_predictor.global_cov
-
+        radius = float(np.mean(radius_seq))
+        
         print(f"    ✅ Calibration done - Calib Set Coverage: {mean_coverage_calib:.3f}, Radius: {radius:.6f}, Time: {calibration_time:.2f}s")
 
         # 4. Optimize portfolio for each period in V
@@ -630,7 +628,7 @@ def run_ccpo_rolling_dates(
                     predictions.append(pred_scaled)
 
             mean_pred_scaled = torch.stack(predictions).mean(dim=0)
-            mu_pred_raw = loader.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
+            mu_pred_raw = scaler.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
 
             opt_result = optimizer.optimize_portfolio_socp(
                 mu_hat=mu_pred_raw, cov_matrix=cov_matrix, radius=radius_seq[v_idx],

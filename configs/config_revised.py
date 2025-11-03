@@ -6,7 +6,7 @@ from layers.predictors import LSTMModel, DLinear, MLP
 EVALUATION_MODE = "rolling"  # ["direct", "rolling"]
 
 # ---- Data Mode ----
-MODE = "dates"                  # ["dates", "counts"]
+MODE = "counts"                  # ["dates", "counts"]
 
 # ---- Base Settings ----
 DATA_PATH = "./data"
@@ -16,31 +16,33 @@ NUM_ASSETS = 10     # [5, 10, 30, 49]
 ALPHA = 0.05
 SEED = 2025
 BATCH_SIZE = 32 
-DEVICE = 'cuda' if torch.cuda.is_available else 'cpu'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+
+
+# EVALUATION_MODE = "direct" 
 # ---- 'dates' Mode Configuration ----
-# Use This Configuration if EVALUATION_MODE = "direct"
 TRAIN_END_DATES = "2015-12-31" # Model Train End
 VALID_END_DATES = "2020-12-31" # Model Valid(K) End
 TEST_END_DATES  = "2023-12-31" # Model Test(V) End
 
 # ---- 'counts' Mode Configuration ----
-# Use This Configuration if EVALUATION_MODE = "direct"
 TRAIN_LENGTH = 780 # The number of Model Train Sequences
 LEN_K = 520        # The number of Model Valid(K) Sequences
 LEN_V = 260        # The number of Model Test(V) Sequences
 
-# ---- Rolling Window Configuration ----
+
+
 # EVALUATION_MODE = "rolling" 
 class ROLLING:
     WINDOW_TYPE = "sliding"   # ["sliding", "expanding"]
 
     # --- 'counts' Mode Rolling Configuration ---
     class COUNTS:
-        MODEL_TRAIN_LEN = 780       # Train Length for Training Forecasting Model
-        K_LEN = 520                 # K(Calib) Length
-        V_LEN = 52                  # V(Test) Length
-        STEP_SIZE = 52              # Window Seting(Should be same as V_LEN)
+        MODEL_TRAIN_LEN = 52 * 15       # Train Length for Training Forecasting Model
+        K_LEN = 52 * 10                 # K(Calib) Length
+        V_LEN = int(52 * 4)                  # V(Test) Length
+        STEP_SIZE = int(52 * 4)              # Window Seting(Should be same as V_LEN)
 
     # --- 'dates' Mode Rolling Configuration ---
     class DATES:
@@ -57,7 +59,7 @@ class ROLLING:
         STEP_OFFSET = "1Y"       # Window Seting(Should be same as V_PERIOD_OFFSET)
 
         # Rolling Window Start/End Dates
-        ROLLING_START_DATE = "2005-01-01" # First Period for Training Model
+        ROLLING_START_DATE = "2000-01-01" # First Period for Training Model
         ROLLING_END_DATE = None           # Last period for V(if None, set as last date in dataset)
 
 # ---- CPP Configuration ----
@@ -75,18 +77,18 @@ class CCPO:
     LOW_RANK_R = 8      # Low-Rank Approximation for Cov Matrix
     USE_LOCAL_ELLIPSOID = False     # Use Local Ellipsoid
     B = 5       # The Number of Bootstrap Models
-    BATCH_SIZE = 128    # Batch Size
-    EPOCHS = 20     # Epochs
-    LEARNING_RATE = 1e-3        # Learning Rate
+    BATCH_SIZE = 32    # Batch Size
+    EPOCHS = 30     # Epochs
+    LEARNING_RATE = 1e-4        # Learning Rate
     WEIGHTS_PATH = "./weights/ccpo"     # Path Model Weights Saved
-    PATIENCE = 5
+    PATIENCE = 10
     USE_SPCI = True     # True
-    PAST_WINDOW = 26    # Lookback Window for Training
+    PAST_WINDOW = 52    # Lookback Window for Training
     GAMMA = 1.0     # Risk Preference
     FORMULATION = "cco"
-    QRF_BINS = 10,
-    QRF_N_ESTIMATORS = 50,
-    QRF_MAX_DEPTH = 5,
+    QRF_BINS = 10
+    QRF_N_ESTIMATORS = 50
+    QRF_MAX_DEPTH = 5
     CRITERION = "squared_error"
 
 

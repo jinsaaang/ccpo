@@ -7,6 +7,7 @@ import torch
 from typing import Tuple, Optional, List, Union, Dict, Literal
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
+from utils.evaluation_utils import datestr
 
 
 # -----------------------
@@ -214,17 +215,10 @@ class TimeSeriesDataLoader:
         filtered_data_to_use = data_to_use[data_to_use.index >= effective_start_date]
 
 
-        # --- (수정됨) 스케일러 fit 기간 수정 ---
-        # 1) scaler fit on model-train only
-        #    현재 윈도우의 시작점(`effective_start_date`)부터 `train_end`까지의
-        #    *원본* 데이터(`data_to_use`)를 사용.
         if use_scaler:
-            # effective_start_date 이전 lookback 기간 데이터는 포함하지 않음
-            # (시퀀스 생성 시 사용될 데이터와 동일한 기간으로 fit)
+
             fit_df = data_to_use.loc[effective_start_date:train_end]
             self.fit_scaler(fit_df) # fit_scaler handles empty check
-        # --- (수정 끝) ---
-
 
         # 2) 모델용 시퀀스 (필터링된 데이터 사용)
         data_scaled = self.transform(filtered_data_to_use)
@@ -384,9 +378,9 @@ class TimeSeriesDataLoader:
         print("\n[Count mode] Model Split")
         print(f"Raw data start idx: {start_idx}, lookback: {lookback}")
         print(f"Sequence lengths: train_len={train_len}, K={K}, V={V}")
-        print(f"Train seq: {len(X_tr)} ({d_tr[0].date() if len(d_tr)>0 else 'N/A'} ~ {d_tr[-1].date() if len(d_tr)>0 else 'N/A'})")
-        print(f"Valid(K) seq: {len(X_va)} ({d_va[0].date() if len(d_va)>0 else 'N/A'} ~ {d_va[-1].date() if len(d_va)>0 else 'N/A'})")
-        print(f"Test (V) seq: {len(X_te)} ({d_te[0].date() if len(d_te)>0 else 'N/A'} ~ {d_te[-1].date() if len(d_te)>0 else 'N/A'})")
+        print(f"Train seq: {len(X_tr)} ({datestr(d_tr[0]) if len(d_tr)>0 else 'N/A'} ~ {datestr(d_tr[-1]) if len(d_tr)>0 else 'N/A'})")
+        print(f"Valid(K) seq: {len(X_va)} ({datestr(d_va[0]) if len(d_va)>0 else 'N/A'} ~ {datestr(d_va[-1]) if len(d_va)>0 else 'N/A'})")
+        print(f"Test (V) seq: {len(X_te)} ({datestr(d_te[0]) if len(d_te)>0 else 'N/A'} ~ {datestr(d_te[-1]) if len(d_te)>0 else 'N/A'})")
 
         return {
             "model": {
