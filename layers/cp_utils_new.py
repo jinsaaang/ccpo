@@ -57,6 +57,55 @@ def ave_cov_width(df, Y):
     print(f'Average Width is {width_res}')
     return [coverage_res, width_res]
 
+
+def strided_app(a, L, S):
+    """Create strided array for rolling windows"""
+    nrows = ((a.shape[0] - L) // S) + 1
+    shape = (nrows, L) + a.shape[1:]
+    strides = (S * a.strides[0],) + a.strides
+    return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
+
+
+def binning(past_resid, cov_mat_est, alpha, bins=5):
+    """
+    Compute the beta^hat_bin from past_resid by breaking [0,alpha] into bins
+    
+    Args:
+        past_resid: Past residuals
+        cov_mat_est: Covariance matrix estimate
+        alpha: Significance level
+        bins: Number of bins to divide [0, alpha]
+    
+    Returns:
+        Optimal beta value
+    """
+    beta_ls = np.linspace(start=0, stop=alpha, num=bins)
+    sizes = np.zeros(bins)
+    for i in range(bins):
+        width = np.percentile(past_resid, math.ceil(100 * (1 - alpha + beta_ls[i]))) - \
+            np.percentile(past_resid, math.ceil(100 * beta_ls[i]))
+        sizes[i] = ellipsoid_volume(cov_mat_est, width)
+    i_star = np.argmin(sizes)
+    return beta_ls[i_star]
+
+
+def binning_use_RF_quantile_regr(quantile_regr, cov_mat_est, Xtrain, Ytrain, feature, beta_ls, sample_weight=None):
+    """
+    Use Random Forest Quantile Regression for binning
+    
+    API ref: https://sklearn-quantile.readthedocs.io/en/latest/generated/sklearn_quantile.RandomForestQuantileRegressor.html
+    """
+    feature = feature.reshape(1, -1)
+    low_high_pred = quantile_regr.fit(Xtrain, Ytrain, sample_weight).predict(feature)
+    num_mid = int(len(low_high_pred)/2)
+    low_pred, high_pred = low_high_pred[:num_mid], low_high_pred[num_mid:]
+    width = (high_pred-low_pred).flatten()
+    width = [ellipsoid_volume(cov_mat_est, w) for w in width]
+    i_star = np.argmin(width)
+    wid_left, wid_right = low_pred[i_star], high_pred[i_star]
+    return i_star, beta_ls[i_star], wid_left, wid_right
+
+
 window_size = 300
 
 def rolling_avg(x, window=window_size):
@@ -326,7 +375,9 @@ def compute_residuals(model_type, valid_loader, test_loader, models, loader, dev
             print("Warning: 'inverse_transform' method not found in loader. Returning scaled data.")
             return tensor_data
 
-    Yv = gather_targets(valid_loader)  # [N_valid, L, d] (CPU)
+    # LOO 방식: valid_loader가 None이면 valid 부분 스킵
+    if valid_loader is not None:
+        Yv = gather_targets(valid_loader)  # [N_valid, L, d] (CPU)
     Yt = gather_targets(test_loader)   # [N_test,  L, d]
 
     Pv_list, Pt_list = [], []
@@ -335,12 +386,13 @@ def compute_residuals(model_type, valid_loader, test_loader, models, loader, dev
             m.eval()
             m.to(device)
 
-            # Validation set 예측
-            outs_v = []
-            for Xb, yb, _, _ in valid_loader:
-                Xb, _ = prep_inputs(Xb, yb)
-                outs_v.append(m(Xb).detach().cpu())
-            Pv_list.append(torch.cat(outs_v, dim=0))
+            # Validation set 예측 (valid_loader가 있을 때만)
+            if valid_loader is not None:
+                outs_v = []
+                for Xb, yb, _, _ in valid_loader:
+                    Xb, _ = prep_inputs(Xb, yb)
+                    outs_v.append(m(Xb).detach().cpu())
+                Pv_list.append(torch.cat(outs_v, dim=0))
 
             # Test set 예측
             outs_t = []
@@ -349,22 +401,32 @@ def compute_residuals(model_type, valid_loader, test_loader, models, loader, dev
                 outs_t.append(m(Xb).detach().cpu())
             Pt_list.append(torch.cat(outs_t, dim=0))
 
-    Pv = torch.stack(Pv_list).mean(dim=0)  # [N_valid, L, d]
     Pt = torch.stack(Pt_list).mean(dim=0)  # [N_test,  L, d]
-
-    Yv_inv = inverse(Yv, loader)
-    Pv_inv = inverse(Pv, loader)
     Yt_inv = inverse(Yt, loader)
     Pt_inv = inverse(Pt, loader)
-
-    Rv = Yv_inv - Pv_inv
     Rt = Yt_inv - Pt_inv
 
-    return {
-        "valid": {"y_true": Yv_inv, "y_pred": Pv_inv, "resid": Rv},
-        "test":  {"y_true": Yt_inv, "y_pred": Pt_inv, "resid": Rt},
-        "raw":   {
-            "y_valid_scaled": Yv, "yhat_valid_scaled": Pv,
-            "y_test_scaled":  Yt, "yhat_test_scaled":  Pt,
-        },
-    }
+    # Valid 결과 처리: valid_loader가 있으면 계산, 없으면 None
+    if valid_loader is not None:
+        Pv = torch.stack(Pv_list).mean(dim=0)  # [N_valid, L, d]
+        Yv_inv = inverse(Yv, loader)
+        Pv_inv = inverse(Pv, loader)
+        Rv = Yv_inv - Pv_inv
+        return {
+            "valid": {"y_true": Yv_inv, "y_pred": Pv_inv, "resid": Rv},
+            "test":  {"y_true": Yt_inv, "y_pred": Pt_inv, "resid": Rt},
+            "raw":   {
+                "y_valid_scaled": Yv, "yhat_valid_scaled": Pv,
+                "y_test_scaled":  Yt, "yhat_test_scaled":  Pt,
+            },
+        }
+    else:
+        # LOO 방식: valid 없음
+        return {
+            "valid": {"y_true": None, "y_pred": None, "resid": None},
+            "test":  {"y_true": Yt_inv, "y_pred": Pt_inv, "resid": Rt},
+            "raw":   {
+                "y_valid_scaled": None, "yhat_valid_scaled": None,
+                "y_test_scaled":  Yt, "yhat_test_scaled":  Pt,
+            },
+        }

@@ -63,48 +63,58 @@ def run_rolling_evaluation(
 
         if cfg.MODE == "counts":
             cfg_roll_cnt = cfg.ROLLING.COUNTS
-            print(f"\nRolling Config (counts):")
-            print(f"  TrainLen={cfg_roll_cnt.MODEL_TRAIN_LEN}, KLen={cfg_roll_cnt.K_LEN}, VLen={cfg_roll_cnt.V_LEN}, Step={cfg_roll_cnt.STEP_SIZE}")
+            print(f"\nRolling Config (counts) - {cfg_roll.WINDOW_TYPE} window:")
+            print(f"  TrainLen={cfg_roll_cnt.TRAIN_LEN}, TestLen={cfg_roll_cnt.TEST_LEN}, Step={cfg_roll_cnt.STEP_SIZE}")
 
-            train_raw_len = lookback + cfg_roll_cnt.MODEL_TRAIN_LEN
-            k_raw_len = cfg_roll_cnt.K_LEN
-            v_raw_len = cfg_roll_cnt.V_LEN
-            total_window_raw_len = train_raw_len + k_raw_len + v_raw_len
+            train_raw_len = lookback + cfg_roll_cnt.TRAIN_LEN
+            test_raw_len = cfg_roll_cnt.TEST_LEN
             step_size = cfg_roll_cnt.STEP_SIZE
 
-            current_raw_start_idx = 0
+            # Initial window start
+            initial_train_start_idx = 0
+            
+            # Expanding: test_end moves forward by step_size
+            # Sliding: both train_start and test_end move forward by step_size
+            current_test_end_idx = initial_train_start_idx + train_raw_len + test_raw_len
             
             while True:
-                train_start_idx = current_raw_start_idx
-                train_end_idx = train_start_idx + train_raw_len
-                k_end_idx = train_end_idx + k_raw_len
-                v_end_idx = k_end_idx + v_raw_len
+                if cfg_roll.WINDOW_TYPE == "expanding":
+                    # Expanding: train_start fixed at 0, train grows with each window
+                    train_start_idx = initial_train_start_idx
+                    test_end_idx = current_test_end_idx
+                    train_end_idx = test_end_idx - test_raw_len
+                    
+                elif cfg_roll.WINDOW_TYPE == "sliding":
+                    # Sliding: fixed window size, moves forward
+                    test_end_idx = current_test_end_idx
+                    train_end_idx = test_end_idx - test_raw_len
+                    train_start_idx = train_end_idx - train_raw_len
+                else:
+                    raise ValueError(f"Unknown ROLLING.WINDOW_TYPE: {cfg_roll.WINDOW_TYPE}")
 
-                if v_end_idx > total_len:
+                # Check if we've reached the end of data
+                if test_end_idx > total_len:
                     print("\n--- Reached end of data (counts). Stopping. ---")
                     break
 
-                if train_end_idx <= train_start_idx or k_end_idx <= train_end_idx or v_end_idx <= k_end_idx:
-                    print(f"--- Skipping window starting at {train_start_idx}: Invalid lengths (Train={train_raw_len}, K={k_raw_len}, V={v_raw_len}). ---")
-                    current_raw_start_idx += step_size
+                if train_end_idx <= train_start_idx or test_end_idx <= train_end_idx or train_start_idx < 0:
+                    print(f"--- Skipping invalid window: train[{train_start_idx}:{train_end_idx}], test[{train_end_idx}:{test_end_idx}] ---")
+                    current_test_end_idx += step_size
                     continue
 
                 window_definitions.append({
                     "mode": "counts",
                     "train_start_idx": train_start_idx,
-                    "train_len": cfg_roll_cnt.MODEL_TRAIN_LEN,
-                    "K_len": cfg_roll_cnt.K_LEN,
-                    "V_len": cfg_roll_cnt.V_LEN,
-                    "k_start_raw_idx": train_end_idx,
-                    "k_end_raw_idx": k_end_idx,
-                    "v_start_raw_idx": k_end_idx,
-                    "v_end_raw_idx": v_end_idx,
+                    "train_len": cfg_roll_cnt.TRAIN_LEN,
+                    "test_len": cfg_roll_cnt.TEST_LEN,
+                    "train_start_raw_idx": train_start_idx,
+                    "train_end_raw_idx": train_end_idx,
+                    "test_start_raw_idx": train_end_idx,
+                    "test_end_raw_idx": test_end_idx,
                 })
 
-                if cfg_roll.WINDOW_TYPE in ["sliding", "expanding"]:
-                    current_raw_start_idx += step_size
-                else:
-                    raise ValueError(f"Unknown ROLLING.WINDOW_TYPE: {cfg_roll.WINDOW_TYPE}")
+                # Move test_end forward for next window
+                current_test_end_idx += step_size
 
         elif cfg.MODE == "dates":
             cfg_roll_dt = cfg.ROLLING.DATES
@@ -163,6 +173,9 @@ def run_rolling_evaluation(
 
         print(f"\nTotal valid windows defined: {len(window_definitions)}")
 
+        # Initialize accumulator for test residuals (for covariance update)
+        accumulated_test_residuals_list = []
+
         for i, window in enumerate(window_definitions):
             window_num = i + 1
 
@@ -170,14 +183,17 @@ def run_rolling_evaluation(
             print(f"RUNNING WINDOW {window_num}/{len(window_definitions)} ({cfg_roll.WINDOW_TYPE} / {cfg.MODE})")
 
             if window["mode"] == "counts":
-                k_start_idx, k_end_idx = window["k_start_raw_idx"], window["k_end_raw_idx"]
-                v_start_idx, v_end_idx = window["v_start_raw_idx"], window["v_end_raw_idx"]
-                K_data_raw = full_data_resampled.iloc[k_start_idx : k_end_idx]
-                V_data_raw = full_data_resampled.iloc[v_start_idx : v_end_idx]
-                train_s, train_e = window["train_start_idx"], window["k_start_raw_idx"]
-                k_s, k_e = window["k_start_raw_idx"], window["k_end_raw_idx"]
-                v_s, v_e = window["v_start_raw_idx"], window["v_end_raw_idx"]
-                print(f"  Raw Idx: Train=[{train_s}:{train_e}], K=[{k_s}:{k_e}], V=[{v_s}:{v_e}]")
+                train_start_idx = window["train_start_raw_idx"]
+                train_end_idx = window["train_end_raw_idx"]
+                test_start_idx = window["test_start_raw_idx"]
+                test_end_idx = window["test_end_raw_idx"]
+                
+                train_data_raw = full_data_resampled.iloc[train_start_idx : train_end_idx]
+                test_data_raw = full_data_resampled.iloc[test_start_idx : test_end_idx]
+                
+                train_s, train_e = train_start_idx, train_end_idx
+                test_s, test_e = test_start_idx, test_end_idx
+                print(f"  Raw Idx: Train=[{train_s}:{train_e}], Test=[{test_s}:{test_e}]")
 
             else:
                 k_start, k_end = window["k_start_date"], window["k_end_date"]
@@ -187,25 +203,35 @@ def run_rolling_evaluation(
                 train_s, train_e = window["train_start_date"], window["train_end_date"]
                 print(f"  Dates: Train=[{train_s.date()}~{train_e.date()}], K=[{k_start.date()}~{k_end.date()}], V=[{v_start.date()}~{v_end.date()}]")
 
-            if K_data_raw.empty or V_data_raw.empty:
-                print(f"--- Skipping window {window_num}: Empty K or V data based on calculated boundaries. ---")
-                continue
+            if window["mode"] == "counts":
+                if train_data_raw.empty or test_data_raw.empty:
+                    print(f"--- Skipping window {window_num}: Empty train or test data. ---")
+                    continue
+                
+                train_returns_raw = train_data_raw.values
+                test_returns_raw = test_data_raw.values
+                test_dates = test_data_raw.index
 
-            K_returns_raw = K_data_raw.values
-            V_returns_raw = V_data_raw.values
-            V_dates = V_data_raw.index
+                print(f"  Train Period Data: {len(train_data_raw)} obs [{train_data_raw.index.min().date()} ~ {train_data_raw.index.max().date()}]")
+                print(f"  Test Period Data: {len(test_data_raw)} obs [{test_dates.min().date()} ~ {test_dates.max().date()}]")
+            else:
+                if K_data_raw.empty or V_data_raw.empty:
+                    print(f"--- Skipping window {window_num}: Empty K or V data. ---")
+                    continue
+                    
+                train_returns_raw = K_data_raw.values
+                test_returns_raw = V_data_raw.values
+                test_dates = V_data_raw.index
 
-            print(f"  K(Calib) Period Data: {len(K_data_raw)} obs [{K_data_raw.index.min().date()} ~ {K_data_raw.index.max().date()}]")
-            print(f"  V(Test) Period Data: {len(V_data_raw)} obs [{V_dates.min().date()} ~ {V_dates.max().date()}]")
             print(f"{'='*80}\n")
 
-            # 4.2) CPP 실행 (K 기간 데이터 사용)
+            # 4.2) CPP 실행 (train 기간 데이터 사용)
             window_results = {}
             for cpp_method in cpp_methods:
                 cpp_res = run_cpp_direct(
-                    K_returns=K_returns_raw,
+                    K_returns=train_returns_raw,
                     L_returns=None,
-                    V_returns=V_returns_raw,
+                    V_returns=test_returns_raw,
                     method=cpp_method,
                     alpha=alpha,
                 )
@@ -213,24 +239,36 @@ def run_rolling_evaluation(
 
             # 4.3) CCPO for counts mode
             if window["mode"] == "counts":
+                # Prepare accumulated test residuals from previous windows
+                accumulated_residuals = None
+                if cfg.CCPO.USE_COV_UPDATE and len(accumulated_test_residuals_list) > 0:
+                    accumulated_residuals = np.vstack(accumulated_test_residuals_list)
+                    print(f"  Using {len(accumulated_residuals)} accumulated test residuals from {len(accumulated_test_residuals_list)} previous windows")
+                
                 ccpo_res = run_ccpo_rolling_counts(
                     data_path=cfg.DATA_PATH, lookback=lookback, alpha=alpha,
-                    model_train_len=window["train_len"],
-                    K_len=window["K_len"],
-                    V_len=window["V_len"],
+                    train_len=window["train_len"],
+                    test_len=window["test_len"],
                     start_idx=window["train_start_idx"],
-                    V_dates=V_dates,
-                    V_returns_raw=V_returns_raw,
-                    cfg=cfg
+                    test_dates=test_dates,
+                    test_returns_raw=test_returns_raw,
+                    cfg=cfg,
+                    accumulated_test_residuals=accumulated_residuals
                 )
+                
+                # Store current window's test residuals for next window
+                if cfg.CCPO.USE_COV_UPDATE and ccpo_res.get('test_residuals') is not None:
+                    accumulated_test_residuals_list.append(ccpo_res['test_residuals'])
+                    print(f"  ✅ Stored {len(ccpo_res['test_residuals'])} test residuals for future windows")
+                
             else:  # dates mode
                 ccpo_res = run_ccpo_rolling_dates(
                     data_path=cfg.DATA_PATH, lookback=lookback, alpha=alpha,
                     train_start_date=window["train_start_date"],
                     train_end_date=window["train_end_date"],
                     K_end_date=window["k_end_date"],
-                    V_dates=V_dates,
-                    V_returns_raw=V_returns_raw,
+                    V_dates=test_dates,
+                    V_returns_raw=test_returns_raw,
                     cfg=cfg
                 )
             window_results["CCPO-CCO"] = ccpo_res
@@ -250,7 +288,7 @@ def run_rolling_evaluation(
                 window_results["Equal-Weight"] = {'status': 'skipped'}
                 print(f"    Skipped (no assets).")
 
-            # 4.5) 현 윈도우 결과를 전역 포트폴리오에 추가 (V 기간)
+            # 4.5) 현 윈도우 결과를 전역 포트폴리오에 추가 (test 기간)
             print("\n  Adding window results to portfolio logs...")
             for method in all_methods:
                 result = window_results.get(method)
@@ -265,14 +303,14 @@ def run_rolling_evaluation(
                     solve_time = result['calibration_time'] + result['optimization_time']
                     
                     if weights is not None:
-                        for date, asset_ret_raw in zip(V_dates, V_returns_raw):
+                        for date, asset_ret_raw in zip(test_dates, test_returns_raw):
                             portfolios[method].add_period(
                                 date=date, weight=weights,
                                 realized_return=float(weights @ asset_ret_raw),
-                                solve_time=solve_time / len(V_dates) if len(V_dates) > 0 else 0.0,
+                                solve_time=solve_time / len(test_dates) if len(test_dates) > 0 else 0.0,
                                 threshold_post=threshold,
                             )
-                        print(f"    Method '{method}': Added {len(V_dates)} periods.")
+                        print(f"    Method '{method}': Added {len(test_dates)} periods.")
                     else:
                         print(f"    Method '{method}': Skipped (no weights).")                            
                     
@@ -283,14 +321,14 @@ def run_rolling_evaluation(
                     solve_time = result.get('solve_time', 0.0)
                     
                     if weights is not None:
-                        for date, asset_ret_raw in zip(V_dates, V_returns_raw):
+                        for date, asset_ret_raw in zip(test_dates, test_returns_raw):
                             portfolios[method].add_period(
                                 date=date, weight=weights,
                                 realized_return=float(weights @ asset_ret_raw),
-                                solve_time=solve_time / len(V_dates) if len(V_dates) > 0 else 0.0,
+                                solve_time=solve_time / len(test_dates) if len(test_dates) > 0 else 0.0,
                                 threshold_post=threshold,
                             )
-                        print(f"    Method '{method}': Added {len(V_dates)} periods.")
+                        print(f"    Method '{method}': Added {len(test_dates)} periods.")
                     else:
                         print(f"    Method '{method}': Skipped (no weights).")
                 else:

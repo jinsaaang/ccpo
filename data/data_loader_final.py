@@ -295,15 +295,21 @@ class TimeSeriesDataLoader:
     def create_all_by_counts(
         self,
         lookback: int,
-        train_len: int,  # 모델 Train 시퀀스 개수(= K 시작 이전)
-        K: int,          # Valid(K) 시퀀스 개수
-        V: int,          # Test(V) 시퀀스 개수
+        train_len: int,  # In-sample length (for training & LOO calibration)
+        test_len: int,   # Out-of-sample length (for evaluation)
         start_idx: int = 0,
         batch_size: int = 32,
         shuffle_train: bool = True,
         use_scaler: bool = True,
-        frequency: Literal['daily', 'weekly'] = 'daily', # frequency 인자는 create_all에서 처리됨
+        frequency: Literal['daily', 'weekly'] = 'daily',
     ) -> Dict[str, object]:
+        """
+        Create train/test split for LOO methodology.
+        
+        Args:
+            train_len: Number of in-sample sequences (for training & calibration via LOO)
+            test_len: Number of out-of-sample sequences (for evaluation)
+        """
         if self.raw_data is None:
             self.load_data()
 
@@ -312,7 +318,7 @@ class TimeSeriesDataLoader:
         data_to_use = self.data
 
         # 필요한 총 원본 데이터 길이 계산
-        total_sequence_len = train_len + K + V
+        total_sequence_len = train_len + test_len
         total_raw_len_needed = lookback + total_sequence_len
 
         end_idx = start_idx + total_raw_len_needed
@@ -326,16 +332,16 @@ class TimeSeriesDataLoader:
         # 1) window
         window_df = data_to_use.iloc[start_idx:end_idx]
 
-        # 2) scaler fit
+        # 2) scaler fit (on train period only)
         if use_scaler:
             fit_df = window_df.iloc[: (lookback + train_len)]
-            self.fit_scaler(fit_df) # fit_scaler handles empty check
+            self.fit_scaler(fit_df)
 
         # 3) 모델용 시퀀스
         scaled_df = self.transform(window_df)
         X_all, y_all, dates_all = self.create_sequences(scaled_df, lookback=lookback)
 
-        # 4) 최적화용 시퀀스
+        # 4) 최적화용 시퀀스 (raw returns)
         _, yr, dtr = self.create_sequences(window_df, lookback)
         if len(dates_all) != len(dtr):
              raise AssertionError("Scaled/Raw sequence length mismatch in count mode.")
@@ -344,54 +350,47 @@ class TimeSeriesDataLoader:
         if not np.all(dates_all == dtr):
             raise AssertionError("Scaled/Raw sequence dates misaligned in count mode.")
 
-
         # 생성된 시퀀스 수 확인
         if len(X_all) < total_sequence_len:
             raise ValueError(
-                f"Sequence count {len(X_all)} is less than required train_len+K+V={total_sequence_len}."
+                f"Sequence count {len(X_all)} is less than required train_len+test_len={total_sequence_len}."
             )
 
-        # 5) 인덱스 스플릿
-        tr_slice = slice(0, train_len)
-        va_slice = slice(train_len, train_len + K)
-        te_slice = slice(train_len + K, total_sequence_len)
+        # 5) 인덱스 스플릿 (train/test 2-way split)
+        train_slice = slice(0, train_len)
+        test_slice = slice(train_len, total_sequence_len)
 
         # 모델용 분할 → DataLoader
-        X_tr, y_tr = X_all[tr_slice], y_all[tr_slice]
-        X_va, y_va = X_all[va_slice], y_all[va_slice]
-        X_te, y_te = X_all[te_slice], y_all[te_slice]
+        X_train, y_train = X_all[train_slice], y_all[train_slice]
+        X_test, y_test = X_all[test_slice], y_all[test_slice]
 
-        d_tr = np.array(dates_all[tr_slice])
-        d_va = np.array(dates_all[va_slice])
-        d_te = np.array(dates_all[te_slice])
+        d_train = np.array(dates_all[train_slice])
+        d_test = np.array(dates_all[test_slice])
 
-        model_train_loader = DataLoader(TimeSeriesDataset(X_tr, y_tr, unsqueeze_y=True), batch_size=batch_size, shuffle=shuffle_train)
-        model_valid_loader = DataLoader(TimeSeriesDataset(X_va, y_va, unsqueeze_y=True), batch_size=batch_size, shuffle=False)
-        model_test_loader  = DataLoader(TimeSeriesDataset(X_te, y_te, unsqueeze_y=True), batch_size=batch_size, shuffle=False)
+        model_train_loader = DataLoader(TimeSeriesDataset(X_train, y_train, unsqueeze_y=True), batch_size=batch_size, shuffle=shuffle_train)
+        model_test_loader  = DataLoader(TimeSeriesDataset(X_test, y_test, unsqueeze_y=True), batch_size=batch_size, shuffle=False)
 
         # 최적화용 분할
-        y_K = yr[va_slice]
-        y_V = yr[te_slice]
-        t_K = np.array(dtr[va_slice])
-        t_V = np.array(dtr[te_slice])
+        y_train_opt = yr[train_slice]
+        y_test_opt = yr[test_slice]
+        t_train = np.array(dtr[train_slice])
+        t_test = np.array(dtr[test_slice])
 
-        print("\n[Count mode] Model Split")
+        print("\n[Count mode] Model Split (Train/Test 2-way)")
         print(f"Raw data start idx: {start_idx}, lookback: {lookback}")
-        print(f"Sequence lengths: train_len={train_len}, K={K}, V={V}")
-        print(f"Train seq: {len(X_tr)} ({datestr(d_tr[0]) if len(d_tr)>0 else 'N/A'} ~ {datestr(d_tr[-1]) if len(d_tr)>0 else 'N/A'})")
-        print(f"Valid(K) seq: {len(X_va)} ({datestr(d_va[0]) if len(d_va)>0 else 'N/A'} ~ {datestr(d_va[-1]) if len(d_va)>0 else 'N/A'})")
-        print(f"Test (V) seq: {len(X_te)} ({datestr(d_te[0]) if len(d_te)>0 else 'N/A'} ~ {datestr(d_te[-1]) if len(d_te)>0 else 'N/A'})")
+        print(f"Sequence lengths: train_len={train_len}, test_len={test_len}")
+        print(f"Train seq: {len(X_train)} ({datestr(d_train[0]) if len(d_train)>0 else 'N/A'} ~ {datestr(d_train[-1]) if len(d_train)>0 else 'N/A'})")
+        print(f"Test seq: {len(X_test)} ({datestr(d_test[0]) if len(d_test)>0 else 'N/A'} ~ {datestr(d_test[-1]) if len(d_test)>0 else 'N/A'})")
 
         return {
             "model": {
                 "train_loader": model_train_loader,
-                "valid_loader": model_valid_loader,
                 "test_loader":  model_test_loader,
-                "dates": {"train": d_tr, "valid": d_va, "test": d_te},
+                "dates": {"train": d_train, "test": d_test},
             },
             "opt": {
-                "y_K": y_K, "dates_K": t_K,
-                "y_V": y_V, "dates_V": t_V,
+                "y_train": y_train_opt, "dates_train": t_train,
+                "y_test": y_test_opt, "dates_test": t_test,
             },
             "scaler": self.scaler,
         }
@@ -419,7 +418,7 @@ class TimeSeriesDataLoader:
         - 'weekly'        : 주간 리샘플링 ('W-FRI' - 금요일 기준)
 
         - mode='counts' -> create_all_by_counts(...)
-            필수: lookback, train_len, K, V
+            필수: lookback, train_len, test_len
             선택: start_idx, batch_size, shuffle_train, use_scaler, resample_freq
         - mode='dates'  -> create_all_by_dates(...)
             필수: lookback, train_end_date, val_end_date
@@ -437,12 +436,11 @@ class TimeSeriesDataLoader:
         self.resample_frequency(self.raw_data, frequency)
         
         if mode == "counts":
-            self._require_keys(kwargs, ["lookback", "train_len", "K", "V"])
+            self._require_keys(kwargs, ["lookback", "train_len", "test_len"])
             return self.create_all_by_counts(
                 lookback=kwargs["lookback"],
                 train_len=kwargs["train_len"],
-                K=kwargs["K"],
-                V=kwargs["V"],
+                test_len=kwargs["test_len"],
                 start_idx=kwargs.get("start_idx", 0),
                 batch_size=kwargs.get("batch_size", 32),
                 shuffle_train=kwargs.get("shuffle_train", True),

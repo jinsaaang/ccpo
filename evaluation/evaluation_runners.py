@@ -7,8 +7,9 @@ import torch
 import traceback
 from configs import config_revised as config
 from data.data_loader_final import TimeSeriesDataLoader
+from data.data_loader_multistep import FactorDataLoaderMultiStep
 import cpp.solver as cpp_solver
-from layers.multi_cp import SPCI_and_EnbPI 
+from layers.multi_cp_new import SPCI_and_EnbPI  # Use LOO version (2-way split)
 from evaluation.run_ccpo import CCPOPortfolioOptimizer
 from utils.evaluation_utils import _build_create_all_kwargs
 
@@ -186,8 +187,9 @@ def run_ccpo_direct(
         )
 
         print(f"    Calibrating conformal prediction intervals (using K period)...")
+        # ⚠️ Important: When use_SPCI=True, smallT should be False for QRF training
         conformal_predictor.compute_Widths_Ensemble_online(
-            alpha=alpha, smallT=False, use_SPCI=cfg.CCPO.USE_SPCI,
+            alpha=alpha, smallT=(not cfg.CCPO.USE_SPCI), use_SPCI=cfg.CCPO.USE_SPCI,
             past_window=cfg.CCPO.PAST_WINDOW, random_state=cfg.SEED
         )
         calibration_time = time.time() - start_time_calib
@@ -304,73 +306,94 @@ def run_ccpo_direct(
 # ============================================================================
 
 def run_ccpo_rolling_counts(
-    data_path: str, # Usually config.DATA_PATH
+    data_path: str,
     lookback: int,
     alpha: float,
     # --- Rolling Period Info ---
-    model_train_len: int,   # Length of Train period (before K)
-    K_len: int,             # Length of Calib (K) period
-    V_len: int,             # Length of Test (V) period
-    start_idx: int,         # Raw data start index for the Train+K+V window
-    # --- V period actual data (for optimization/eval) ---
-    V_dates: pd.DatetimeIndex,
-    V_returns_raw: np.ndarray, # RAW returns for V period
-    cfg: config = config
+    train_len: int,         # In-sample length (for training & LOO calibration)
+    test_len: int,          # Out-of-sample length (for evaluation)
+    start_idx: int,         # Raw data start index for the Train+Test window
+    # --- Test period actual data (for optimization/eval) ---
+    test_dates: pd.DatetimeIndex,
+    test_returns_raw: np.ndarray,  # RAW returns for test period
+    cfg: config = config,
+    # --- New: Past residuals for covariance update ---
+    accumulated_test_residuals: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """
     Run CCPO method for one window in rolling evaluation (MODE=counts).
-    Uses Train / K / V lengths relative to start_idx.
+    Uses train/test 2-way split with LOO methodology.
+    
+    New features:
+    - Loader selection based on cfg.CCPO.USE_MULTISTEP
+    - Loss aggregation option: cfg.CCPO.LOSS_AGGREGATION
+    - Prediction aggregation: cfg.CCPO.AGGREGATION_METHOD
+    - Covariance update: cfg.CCPO.USE_COV_UPDATE
     """
-    print(f"  Running CCPO-CCO (Rolling Window - Counts)...")
-    print(f"    TrainLen={model_train_len}, KLen(Calib)={K_len}, VLen(Test)={V_len}, StartIdx={start_idx}")
+    print(f"  Running CCPO-CCO (Rolling Window - Counts with LOO)...")
+    print(f"    TrainLen={train_len}, TestLen={test_len}, StartIdx={start_idx}")
 
     start_time_total = time.time()
-    loader = TimeSeriesDataLoader(base_path=config.DATA_PATH, num_assets=cfg.NUM_ASSETS)
-    n_assets = V_returns_raw.shape[1] if V_returns_raw.ndim > 1 else (1 if V_returns_raw.size > 0 else 0)
+    
+    # === LOADER SELECTION ===
+    if cfg.CCPO.USE_MULTISTEP:
+        print(f"    Using Multi-step Loader (daily input, horizon={cfg.CCPO.HORIZON_MAP.get(cfg.FREQUENCY, 1)})")
+        loader = FactorDataLoaderMultiStep(data_path=cfg.DATA_PATH, num_assets=cfg.NUM_ASSETS)
+        horizon = cfg.CCPO.HORIZON_MAP.get(cfg.FREQUENCY, 1)
+    else:
+        print(f"    Using Standard Loader (resampled {cfg.FREQUENCY}, horizon=1)")
+        loader = TimeSeriesDataLoader(base_path=cfg.DATA_PATH, num_assets=cfg.NUM_ASSETS)
+        horizon = 1
+    
+    n_assets = test_returns_raw.shape[1] if test_returns_raw.ndim > 1 else (1 if test_returns_raw.size > 0 else 0)
 
     try:
-        # 1. Load data specifically for this window's Train and K periods
-        #    V period data (V_returns_raw) is already provided.
-        res = loader.create_all(
-            mode="counts",
-            lookback=cfg.LOOKBACK,
-            train_len=model_train_len, # Model Train length
-            K=K_len,                 # Model Valid/Calib (K) length
-            V=V_len,                     # We handle V manually using V_returns_raw
-            start_idx=start_idx,       # Starting index for the raw data window
-            batch_size=cfg.CCPO.BATCH_SIZE, # Use CCPO batch size for model loading
-            shuffle_train=True,
-            use_scaler=True,
-            resample_freq=cfg.FREQUENCY # Should match overall frequency
-        )
-
-        train_loader = res['model']['train_loader']
-        valid_loader = res['model']['valid_loader'] # K period for Calibration
-        test_loader = res['model']['test_loader']
-        scaler = res['scaler'] # Scaler fitted on Train period raw data
-
-        if len(train_loader.dataset) == 0 or len(valid_loader.dataset) == 0:
-             raise ValueError("Train or Validation (K) data loader is empty for this window.")
-
-        # 2. Initialize optimizer
-        optimizer = CCPOPortfolioOptimizer(
-            alpha=alpha, model_cls=cfg.CCPO.MODEL_CLASS,
-            device=cfg.DEVICE, r=cfg.CCPO.LOW_RANK_R,
-            use_local_ellipsoid=cfg.CCPO.USE_LOCAL_ELLIPSOID
-        )
-
-        # 3. Train models and Calibrate using Train and Valid(K) loaders
-        print(f"    Training {cfg.CCPO.B} bootstrap models...")
+        # 1. Load data for this window (train/test split)
+        if cfg.CCPO.USE_MULTISTEP:
+            # Multi-step loader
+            res = loader.create_all_by_counts(
+                train_len=train_len,
+                test_len=test_len,
+                lookback=cfg.LOOKBACK,
+                horizon=horizon,
+                train_start_idx=start_idx
+            )
+            # Convert to tensors
+            X_train = torch.FloatTensor(res['X_train'])
+            Y_train = torch.FloatTensor(res['Y_train'])
+            X_test = torch.FloatTensor(res['X_test'])
+            Y_test = torch.FloatTensor(res['Y_test'])
+            scaler = res['scaler']
+        else:
+            # Standard loader
+            res = loader.create_all(
+                mode="counts",
+                lookback=cfg.LOOKBACK,
+                train_len=train_len,
+                test_len=test_len,
+                start_idx=start_idx,
+                batch_size=cfg.CCPO.BATCH_SIZE,
+                shuffle_train=True,
+                use_scaler=True,
+                resample_freq=cfg.FREQUENCY
+            )
+            train_loader = res['model']['train_loader']
+            test_loader = res['model']['test_loader']
+            scaler = res['scaler']
+            
+            if len(train_loader.dataset) == 0:
+                raise ValueError("Train data loader is empty for this window.")
+            
+            X_train, Y_train = train_loader.dataset.X, train_loader.dataset.y
+            X_test, Y_test = test_loader.dataset.X, test_loader.dataset.y
+        
+        # 2. Initialize conformal predictor with LOO
+        print(f"    Training {cfg.CCPO.B} bootstrap models with LOO...")
         start_time_calib = time.time()
-
-        X_train, Y_train = train_loader.dataset.X, train_loader.dataset.y
-        X_valid, Y_valid = valid_loader.dataset.X, valid_loader.dataset.y # K data
-        X_predict, Y_predict = test_loader.dataset.X, test_loader.dataset.y # V data
-                
         
         conformal_predictor = SPCI_and_EnbPI(
-            X_train, X_valid, X_predict,
-            Y_train, Y_valid, Y_predict,
+            X_train, X_test,
+            Y_train, Y_test,
             model_cls=cfg.CCPO.MODEL_CLASS, loader=loader, scaler=scaler,
             device=cfg.DEVICE, r=cfg.CCPO.LOW_RANK_R,
             use_local_ellipsoid=cfg.CCPO.USE_LOCAL_ELLIPSOID,
@@ -380,15 +403,25 @@ def run_ccpo_rolling_counts(
             criterion=cfg.CCPO.CRITERION
         )
 
+        # 3. Fit models with loss aggregation and CP residual mode options
         conformal_predictor.fit_bootstrap_models_online_multistep(
             B=cfg.CCPO.B, batch_size=cfg.CCPO.BATCH_SIZE, EPOCHS=cfg.CCPO.EPOCHS,
             lr=cfg.CCPO.LEARNING_RATE, path=cfg.CCPO.WEIGHTS_PATH,
-            patience=cfg.CCPO.PATIENCE, valid_mode=True
+            patience=cfg.CCPO.PATIENCE, valid_mode=False,  # LOO doesn't use validation
+            loss_aggregation=cfg.CCPO.LOSS_AGGREGATION,
+            cp_residual_mode=cfg.CCPO.CP_RESIDUAL_MODE
         )
+        
+        # 4. Update covariance with past test residuals if enabled
+        if cfg.CCPO.USE_COV_UPDATE and accumulated_test_residuals is not None:
+            conformal_predictor.update_covariance_with_past_residuals(accumulated_test_residuals)
 
-        print(f"    Calibrating conformal prediction intervals (using K period)...")
+        # 5. Calibrate conformal intervals
+        print(f"    Calibrating conformal prediction intervals (using train period with LOO)...")
+        # ⚠️ Important: When use_SPCI=True, smallT should be False to have enough training points for QRF
+        # See original paper code comment: "if fit quantile regression, set it to be FALSE"
         conformal_predictor.compute_Widths_Ensemble_online(
-            alpha=alpha, smallT=False, use_SPCI=cfg.CCPO.USE_SPCI,
+            alpha=alpha, smallT=(not cfg.CCPO.USE_SPCI), use_SPCI=cfg.CCPO.USE_SPCI,
             past_window=cfg.CCPO.PAST_WINDOW, random_state=cfg.SEED
         )
         calibration_time = time.time() - start_time_calib
@@ -396,51 +429,56 @@ def run_ccpo_rolling_counts(
         mean_coverage_calib, _, _, _, radius_seq = conformal_predictor.get_results()
         if not radius_seq: raise ValueError("Calibration failed: Radius sequence is empty.")
         
-        radius = float(np.mean(radius_seq))
-        cov_matrix = conformal_predictor.global_cov
+        # ✅ Residuals are now computed in raw space, so no transformation needed
+        radius = float(np.mean(radius_seq))  # Already in raw space
+        cov_matrix = conformal_predictor.global_cov  # Already in raw space
 
-        print(f"    ✅ Calibration done - Calib Set Coverage: {mean_coverage_calib:.3f}, Radius: {radius:.6f}, Time: {calibration_time:.2f}s")
+        print(f"    ✅ Calibration done - Coverage: {mean_coverage_calib:.3f}, Radius: {radius:.6f}, Time: {calibration_time:.2f}s")
 
-        # 4. Optimize portfolio for each period in V
-        print(f"    Optimizing portfolio for each of {len(V_dates)} test periods (V)...")
+        # 4. Initialize optimizer
+        optimizer = CCPOPortfolioOptimizer(
+            alpha=alpha, model_cls=cfg.CCPO.MODEL_CLASS,
+            device=cfg.DEVICE, r=cfg.CCPO.LOW_RANK_R,
+            use_local_ellipsoid=cfg.CCPO.USE_LOCAL_ELLIPSOID
+        )
+
+        # 5. Optimize portfolio for each period in test
+        print(f"    Optimizing portfolio for each of {len(test_dates)} test periods...")
         start_time_opt = time.time()
         portfolios_list = []
 
-        # Need full raw data series for lookback windows during V period
-        full_returns_raw = loader.resample_frequency(loader.raw_data, cfg.FREQUENCY)
-        full_returns_values = full_returns_raw.values
-        full_returns_dates = full_returns_raw.index
+        if len(test_dates) == 0:
+             print("    Note: No test periods to optimize for.")
 
-        if len(V_dates) == 0:
-             print("    Note: No V periods to optimize for.")
-
-        for v_idx, v_date in enumerate(V_dates):
-            try:
-                date_idx = full_returns_dates.get_loc(v_date)
-            except KeyError:
-                date_idx = full_returns_dates.get_indexer([v_date], method='nearest')[0]
-                print(f"      Warning: Date {v_date.date()} not found exactly, using nearest: {full_returns_dates[date_idx].date()}")
-
-            if date_idx < lookback:
-                print(f"      ⚠️  Skipping {v_date.date()}: not enough history ({date_idx} < {lookback})")
-                continue
-
-            X_test_raw = full_returns_values[date_idx - lookback: date_idx]
-            if scaler: X_test_scaled = scaler.transform(X_test_raw)
-            else: X_test_scaled = X_test_raw
-            X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(0).to(cfg.DEVICE)
+        # Use pre-computed test sequences from conformal_predictor
+        # X_test is already available in conformal_predictor
+        for test_idx, test_date in enumerate(test_dates):
+            # Get pre-scaled test input
+            X_test_tensor = X_test[test_idx:test_idx+1].to(cfg.DEVICE)  # [1, lookback, d]
 
             predictions = []
             with torch.no_grad():
                 for b in range(cfg.CCPO.B):
                     model = conformal_predictor.models[b]
                     model.eval()
-                    pred_scaled = model(X_test_tensor)
-                    if pred_scaled.ndim == 3 and pred_scaled.shape[1] == 1: pred_scaled = pred_scaled.squeeze(1)
+                    pred_scaled = model(X_test_tensor)  # [1, horizon, d] or [1, d]
+                    
+                    # Handle multi-step predictions
+                    if pred_scaled.ndim == 3:
+                        # Multi-step: [1, horizon, d] -> aggregate based on config
+                        if cfg.CCPO.AGGREGATION_METHOD == "last":
+                            pred_scaled = pred_scaled[:, -1, :]  # [1, d]
+                        else:  # mean
+                            pred_scaled = pred_scaled.mean(dim=1)  # [1, d]
+                    elif pred_scaled.ndim == 3 and pred_scaled.shape[1] == 1:
+                        pred_scaled = pred_scaled.squeeze(1)  # [1, d]
+                    
                     predictions.append(pred_scaled)
 
-            mean_pred_scaled = torch.stack(predictions).mean(dim=0)
-            mu_pred_raw = scaler.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
+            mean_pred_scaled = torch.stack(predictions).mean(dim=0)  # [1, d]
+            
+            # Inverse transform to raw space
+            mu_pred_raw = loader.inverse_transform(mean_pred_scaled.cpu().numpy()).flatten()
 
             opt_result = optimizer.optimize_portfolio_socp(
                 mu_hat=mu_pred_raw, cov_matrix=cov_matrix, radius=radius,
@@ -449,25 +487,31 @@ def run_ccpo_rolling_counts(
 
             if opt_result['status'] == 'optimal':
                 portfolios_list.append({
-                    'date': v_date, 'weights': opt_result['weights'],
+                    'date': test_date, 'weights': opt_result['weights'],
                     'threshold': opt_result['threshold']
                 })
             else:
-                print(f"      ⚠️  Optimization failed for {v_date.date()}: {opt_result['status']}")
+                print(f"      ⚠️  Optimization failed for {test_date.date()}: {opt_result['status']}")
                 portfolios_list.append({
-                    'date': v_date,
+                    'date': test_date,
                     'weights': np.ones(n_assets) / n_assets if n_assets > 0 else np.array([]),
                     'threshold': None
                 })
 
         optimization_time = time.time() - start_time_opt
         total_time = time.time() - start_time_total
-        print(f"    ✅ Completed {len(portfolios_list)}/{len(V_dates)} V periods. Opt Time: {optimization_time:.2f}s, Total Time: {total_time:.2f}s")
+        print(f"    ✅ Completed {len(portfolios_list)}/{len(test_dates)} test periods. Opt Time: {optimization_time:.2f}s, Total Time: {total_time:.2f}s")
+
+        # Get current test residuals for potential covariance update in next window
+        current_test_residuals = None
+        if cfg.CCPO.USE_COV_UPDATE:
+            current_test_residuals = conformal_predictor.test_resid.reshape(-1, conformal_predictor.d).detach().cpu().numpy()
 
         # Return only essential results for rolling aggregation
         return {
             'portfolios': portfolios_list,
             'status': 'optimal',
+            'test_residuals': current_test_residuals,  # For next window's covariance update
             # Optionally include calibration stats if needed for window summary
             'coverage_calib': mean_coverage_calib,
             'radius': radius,
@@ -576,8 +620,9 @@ def run_ccpo_rolling_dates(
         )
 
         print(f"    Calibrating conformal prediction intervals (using K period)...")
+        # ⚠️ Important: When use_SPCI=True, smallT should be False for QRF training
         conformal_predictor.compute_Widths_Ensemble_online(
-            alpha=alpha, smallT=False, use_SPCI=cfg.CCPO.USE_SPCI,
+            alpha=alpha, smallT=(not cfg.CCPO.USE_SPCI), use_SPCI=cfg.CCPO.USE_SPCI,
             past_window=cfg.CCPO.PAST_WINDOW, random_state=cfg.SEED
         )
         calibration_time = time.time() - start_time_calib
